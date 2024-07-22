@@ -145,7 +145,7 @@ impl State {
     }
 }
 
-fn on_init(_r: &mut Congestion) {}
+fn on_init(_r: &mut Congestion, _: Instant) {}
 
 fn on_packet_sent(
     r: &mut Congestion, sent_bytes: usize, bytes_in_flight: usize, now: Instant,
@@ -426,11 +426,11 @@ mod tests {
     use crate::recovery::Recovery;
 
     fn test_sender() -> TestSender {
-        TestSender::new(recovery::CongestionControlAlgorithm::CUBIC, false)
+        TestSender::new(recovery::CongestionControlAlgorithm::CUBIC, false, Instant::now())
     }
 
     fn hystart_test_sender() -> TestSender {
-        TestSender::new(recovery::CongestionControlAlgorithm::CUBIC, true)
+        TestSender::new(recovery::CongestionControlAlgorithm::CUBIC, true, Instant::now())
     }
 
     #[test]

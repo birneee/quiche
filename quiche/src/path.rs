@@ -29,7 +29,7 @@ use std::time;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-
+use std::time::Instant;
 use smallvec::SmallVec;
 
 use slab::Slab;
@@ -209,6 +209,7 @@ impl Path {
         recovery_config: &recovery::RecoveryConfig,
         path_challenge_recv_max_queue_len: usize, pmtud_init: usize,
         is_initial: bool,
+        now: Instant
     ) -> Self {
         let (state, active_scid_seq, active_dcid_seq) = if is_initial {
             (PathState::Validated, Some(0), Some(0))
@@ -223,7 +224,7 @@ impl Path {
             active_dcid_seq,
             state,
             active: false,
-            recovery: recovery::Recovery::new_with_config(recovery_config),
+            recovery: recovery::Recovery::new_with_config(recovery_config, now),
             pmtud: pmtud::Pmtud::new(pmtud_init),
             in_flight_challenges: VecDeque::new(),
             max_challenge_size: 0,
@@ -954,6 +955,7 @@ mod tests {
             config.path_challenge_recv_max_queue_len,
             1200,
             true,
+            Instant::now(),
         );
         let mut path_mgr = PathMap::new(path, 2, false, true, 1200);
 
@@ -964,6 +966,7 @@ mod tests {
             config.path_challenge_recv_max_queue_len,
             1200,
             false,
+            Instant::now(),
         );
         path_mgr.insert_path(probed_path, false).unwrap();
 
@@ -1041,6 +1044,7 @@ mod tests {
             config.path_challenge_recv_max_queue_len,
             1200,
             true,
+            Instant::now(),
         );
         let mut client_path_mgr = PathMap::new(path, 2, false, false, 1200);
         let mut server_path = Path::new(
@@ -1050,6 +1054,7 @@ mod tests {
             config.path_challenge_recv_max_queue_len,
             1200,
             false,
+            Instant::now(),
         );
 
         let client_pid = client_path_mgr
@@ -1133,6 +1138,7 @@ mod tests {
             config.path_challenge_recv_max_queue_len,
             1200,
             true,
+            Instant::now(),
         );
         let mut client_path_mgr = PathMap::new(path, 2, false, false, 1200);
         let mut server_path = Path::new(
@@ -1142,6 +1148,7 @@ mod tests {
             config.path_challenge_recv_max_queue_len,
             1200,
             false,
+            Instant::now(),
         );
 
         let client_pid = client_path_mgr

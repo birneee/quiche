@@ -40,7 +40,7 @@ use std::convert::TryFrom;
 use std::rc::Rc;
 
 use std::cell::RefCell;
-
+use std::time::Instant;
 use ring::rand::*;
 
 use quiche_apps::args::*;
@@ -178,13 +178,15 @@ fn main() {
     let local_addr = socket.local_addr().unwrap();
 
     loop {
+        let now = Instant::now();
+
         // Find the shorter timeout from all the active connections.
         //
         // TODO: use event loop that properly supports timers
         let timeout = match continue_write {
             true => Some(std::time::Duration::from_secs(0)),
 
-            false => clients.values().filter_map(|c| c.conn.timeout()).min(),
+            false => clients.values().filter_map(|c| c.conn.timeout(now)).min(),
         };
 
         let mut poll_res = poll.poll(&mut events, timeout);
@@ -197,6 +199,8 @@ fn main() {
             }
         }
 
+        let now = Instant::now();
+
         // Read incoming UDP packets from the socket and feed them to quiche,
         // until there are no more packets to read.
         'read: loop {
@@ -206,7 +210,7 @@ fn main() {
             if events.is_empty() && !continue_write {
                 trace!("timed out");
 
-                clients.values_mut().for_each(|c| c.conn.on_timeout());
+                clients.values_mut().for_each(|c| c.conn.on_timeout(now));
 
                 break 'read;
             }
@@ -364,6 +368,7 @@ fn main() {
                     local_addr,
                     from,
                     &mut config,
+                    now,
                 )
                 .unwrap();
 
@@ -384,6 +389,7 @@ fn main() {
                             std::boxed::Box::new(writer),
                             "quiche-server qlog".to_string(),
                             format!("{} id={}", "quiche-server qlog", id),
+                            now,
                         );
                     }
                 }
@@ -424,7 +430,7 @@ fn main() {
             };
 
             // Process potentially coalesced packets.
-            let read = match client.conn.recv(pkt_buf, recv_info) {
+            let read = match client.conn.recv(pkt_buf, recv_info, now) {
                 Ok(v) => v,
 
                 Err(e) => {
@@ -515,7 +521,7 @@ fn main() {
                 }
             }
 
-            handle_path_events(client);
+            handle_path_events(client, now);
 
             // See whether source Connection IDs have been retired.
             while let Some(retired_scid) = client.conn.retired_scid_next() {
@@ -533,6 +539,8 @@ fn main() {
                 clients_ids.insert(scid, client.client_id);
             }
         }
+
+        let now = Instant::now();
 
         // Generate outgoing QUIC packets for all active connections and send
         // them on the UDP socket, until quiche reports that there are no more
@@ -560,7 +568,7 @@ fn main() {
             while total_write < max_send_burst {
                 let (write, send_info) = match client
                     .conn
-                    .send(&mut out[total_write..max_send_burst])
+                    .send(&mut out[total_write..max_send_burst], now)
                 {
                     Ok(v) => v,
 
@@ -696,7 +704,7 @@ fn validate_token<'a>(
     Some(quiche::ConnectionId::from_ref(&token[addr.len()..]))
 }
 
-fn handle_path_events(client: &mut Client) {
+fn handle_path_events(client: &mut Client, now: Instant) {
     while let Some(qe) = client.conn.path_event_next() {
         match qe {
             quiche::PathEvent::New(local_addr, peer_addr) => {
@@ -710,7 +718,7 @@ fn handle_path_events(client: &mut Client) {
                 // Directly probe the new path.
                 client
                     .conn
-                    .probe_path(local_addr, peer_addr)
+                    .probe_path(local_addr, peer_addr, now)
                     .expect("cannot probe");
             },
 

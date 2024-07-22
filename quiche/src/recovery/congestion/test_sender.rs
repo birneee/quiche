@@ -48,7 +48,7 @@ pub(crate) struct TestSender {
 }
 
 impl TestSender {
-    pub(crate) fn new(algo: CongestionControlAlgorithm, hystart: bool) -> Self {
+    pub(crate) fn new(algo: CongestionControlAlgorithm, hystart: bool, now: Instant) -> Self {
         let mut cfg = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
         cfg.set_cc_algorithm(algo);
         cfg.enable_hystart(hystart);
@@ -57,9 +57,9 @@ impl TestSender {
             next_pkt: 0,
             next_ack: 0,
             bytes_in_flight: 0,
-            time: Instant::now(),
-            rtt_stats: RttStats::new(Duration::from_micros(0)),
-            cc: Congestion::from_config(&RecoveryConfig::from_config(&cfg)),
+            time: now,
+            rtt_stats: RttStats::new(Duration::from_micros(0), now),
+            cc: Congestion::from_config(&RecoveryConfig::from_config(&cfg), now),
             sent_packets: VecDeque::new(),
         }
     }

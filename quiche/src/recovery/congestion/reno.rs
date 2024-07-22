@@ -51,7 +51,7 @@ pub(crate) static RENO: CongestionControlOps = CongestionControlOps {
     debug_fmt,
 };
 
-pub fn on_init(_r: &mut Congestion) {}
+pub fn on_init(_r: &mut Congestion, _: Instant) {}
 
 pub fn on_packet_sent(
     _r: &mut Congestion, _sent_bytes: usize, _bytes_in_flight: usize,
@@ -160,7 +160,7 @@ mod tests {
     use std::time::Duration;
 
     fn test_sender() -> TestSender {
-        TestSender::new(recovery::CongestionControlAlgorithm::Reno, false)
+        TestSender::new(recovery::CongestionControlAlgorithm::Reno, false, Instant::now())
     }
 
     #[test]

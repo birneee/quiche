@@ -396,9 +396,7 @@ pub struct State {
 }
 
 impl State {
-    pub fn new() -> Self {
-        let now = Instant::now();
-
+    pub fn new(now: Instant) -> Self {
         State {
             tx_in_flight: 0,
 
@@ -454,7 +452,7 @@ impl State {
 
             inflight_latest: 0,
 
-            max_bw_filter: Minmax::new(0),
+            max_bw_filter: Minmax::new(0, now),
 
             cycle_count: 0,
 
@@ -462,7 +460,7 @@ impl State {
 
             extra_acked_delivered: 0,
 
-            extra_acked_filter: Minmax::new(0),
+            extra_acked_filter: Minmax::new(0, now),
 
             filled_pipe: false,
 
@@ -544,8 +542,8 @@ fn bbr2_exit_recovery(r: &mut Congestion) {
 
 // Congestion Control Hooks.
 //
-fn on_init(r: &mut Congestion) {
-    init::bbr2_init(r);
+fn on_init(r: &mut Congestion, now: Instant) {
+    init::bbr2_init(r, now);
 }
 
 fn on_packet_sent(

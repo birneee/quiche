@@ -34,7 +34,7 @@ use std::io::prelude::*;
 use std::rc::Rc;
 
 use std::cell::RefCell;
-
+use std::time::Instant;
 use ring::rand::*;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -186,6 +186,8 @@ pub fn connect(
 
     let local_addr = socket.local_addr().unwrap();
 
+    let now = Instant::now();
+
     // Create a QUIC connection and initiate handshake.
     let mut conn = quiche::connect(
         connect_url.domain(),
@@ -193,6 +195,7 @@ pub fn connect(
         local_addr,
         peer_addr,
         &mut config,
+        now,
     )
     .unwrap();
 
@@ -213,13 +216,14 @@ pub fn connect(
                 std::boxed::Box::new(writer),
                 "quiche-client qlog".to_string(),
                 format!("{} id={}", "quiche-client qlog", id),
+                now,
             );
         }
     }
 
     if let Some(session_file) = &args.session_file {
         if let Ok(session) = std::fs::read(session_file) {
-            conn.set_session(&session).ok();
+            conn.set_session(&session, now).ok();
         }
     }
 
@@ -230,7 +234,7 @@ pub fn connect(
         scid,
     );
 
-    let (write, send_info) = conn.send(&mut out).expect("initial send failed");
+    let (write, send_info) = conn.send(&mut out, now).expect("initial send failed");
 
     while let Err(e) = socket.send_to(&out[..write], send_info.to) {
         if e.kind() == std::io::ErrorKind::WouldBlock {
@@ -257,8 +261,10 @@ pub fn connect(
 
     loop {
         if !conn.is_in_early_data() || app_proto_selected {
-            poll.poll(&mut events, conn.timeout()).unwrap();
+            poll.poll(&mut events, conn.timeout(Instant::now())).unwrap();
         }
+
+        let now = Instant::now();
 
         // If the event loop reported no events, it means that the timeout
         // has expired, so handle it without attempting to read packets. We
@@ -266,7 +272,7 @@ pub fn connect(
         if events.is_empty() {
             trace!("timed out");
 
-            conn.on_timeout();
+            conn.on_timeout(now);
         }
 
         // Read incoming UDP packets from the socket and feed them to quiche,
@@ -318,7 +324,7 @@ pub fn connect(
                 };
 
                 // Process potentially coalesced packets.
-                let read = match conn.recv(&mut buf[..len], recv_info) {
+                let read = match conn.recv(&mut buf[..len], recv_info, now) {
                     Ok(v) => v,
 
                     Err(e) => {
@@ -436,7 +442,7 @@ pub fn connect(
                         "Path ({}, {}) is now validated",
                         local_addr, peer_addr
                     );
-                    conn.migrate(local_addr, peer_addr).unwrap();
+                    conn.migrate(local_addr, peer_addr, now).unwrap();
                     migrated = true;
                 },
 
@@ -492,10 +498,12 @@ pub fn connect(
         {
             let additional_local_addr =
                 migrate_socket.as_ref().unwrap().local_addr().unwrap();
-            conn.probe_path(additional_local_addr, peer_addr).unwrap();
+            conn.probe_path(additional_local_addr, peer_addr, now).unwrap();
 
             new_path_probed = true;
         }
+
+        let now = Instant::now();
 
         // Generate outgoing QUIC packets and send them on the UDP socket, until
         // quiche reports that there are no more packets to be sent.
@@ -513,6 +521,7 @@ pub fn connect(
                         &mut out,
                         Some(local_addr),
                         Some(peer_addr),
+                        now,
                     ) {
                         Ok(v) => v,
 

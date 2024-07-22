@@ -29,7 +29,7 @@ use std::ops::Index;
 use std::ops::IndexMut;
 use std::ops::RangeInclusive;
 use std::time;
-
+use std::time::Instant;
 use ring::aead;
 
 use crate::Error;
@@ -871,11 +871,11 @@ pub struct PktNumSpace {
 }
 
 impl PktNumSpace {
-    pub fn new() -> PktNumSpace {
+    pub fn new(now: Instant) -> PktNumSpace {
         PktNumSpace {
             largest_rx_pkt_num: 0,
 
-            largest_rx_pkt_time: time::Instant::now(),
+            largest_rx_pkt_time: now,
 
             largest_rx_non_probing_pkt_num: 0,
 

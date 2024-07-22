@@ -3209,6 +3209,7 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
     use super::*;
 
     use super::testing::*;
@@ -3254,7 +3255,7 @@ mod tests {
 
         // Configure session on new connection.
         let mut pipe = crate::testing::Pipe::with_config(&mut config).unwrap();
-        assert_eq!(pipe.client.set_session(session), Ok(()));
+        assert_eq!(pipe.client.set_session(session, Instant::now()), Ok(()));
 
         // Can't create an H3 connection until the QUIC connection is determined
         // to have made sufficient early data progress.
@@ -3264,7 +3265,7 @@ mod tests {
         ));
 
         // Client sends initial flight.
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
 
         // Now an H3 connection can be created.
         assert!(Connection::with_transport(&mut pipe.client, &h3_config).is_ok());
@@ -5081,7 +5082,7 @@ mod tests {
 
         // Now read raw frames to see what the QUIC layer did
         let mut buf = [0; 65535];
-        let (len, _) = s.pipe.server.send(&mut buf).unwrap();
+        let (len, _) = s.pipe.server.send(&mut buf, Instant::now()).unwrap();
 
         let frames = decode_pkt(&mut s.pipe.client, &mut buf[..len]).unwrap();
 
@@ -5110,7 +5111,7 @@ mod tests {
             Err(Error::Done)
         );
         assert_eq!(s.pipe.server.streams.blocked().len(), 0);
-        assert_eq!(s.pipe.server.send(&mut buf), Err(crate::Error::Done));
+        assert_eq!(s.pipe.server.send(&mut buf, Instant::now()), Err(crate::Error::Done));
 
         // Now update the client's max offset manually.
         let frames = [crate::frame::Frame::MaxStreamData {
@@ -5139,7 +5140,7 @@ mod tests {
         );
         assert_eq!(s.pipe.server.streams.blocked().len(), 1);
 
-        let (len, _) = s.pipe.server.send(&mut buf).unwrap();
+        let (len, _) = s.pipe.server.send(&mut buf, Instant::now()).unwrap();
 
         let frames = decode_pkt(&mut s.pipe.client, &mut buf[..len]).unwrap();
 

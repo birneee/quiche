@@ -59,10 +59,10 @@ impl std::fmt::Debug for RttStats {
 }
 
 impl RttStats {
-    pub(crate) fn new(max_ack_delay: Duration) -> Self {
+    pub(crate) fn new(max_ack_delay: Duration, now: Instant) -> Self {
         RttStats {
             latest_rtt: Duration::ZERO,
-            min_rtt: Minmax::new(Duration::ZERO),
+            min_rtt: Minmax::new(Duration::ZERO, now),
             smoothed_rtt: INITIAL_RTT,
             rttvar: INITIAL_RTT / 2,
             first_rtt_sample: None,

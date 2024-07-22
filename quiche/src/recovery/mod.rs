@@ -379,7 +379,7 @@ impl RecoveryConfig {
 }
 
 impl Recovery {
-    pub fn new_with_config(recovery_config: &RecoveryConfig) -> Self {
+    pub fn new_with_config(recovery_config: &RecoveryConfig, now: Instant) -> Self {
         Recovery {
             epochs: Default::default(),
 
@@ -387,7 +387,7 @@ impl Recovery {
 
             pto_count: 0,
 
-            rtt_stats: RttStats::new(recovery_config.max_ack_delay),
+            rtt_stats: RttStats::new(recovery_config.max_ack_delay, now),
 
             lost_spurious_count: 0,
 
@@ -408,7 +408,7 @@ impl Recovery {
 
             outstanding_non_ack_eliciting: 0,
 
-            congestion: Congestion::from_config(recovery_config),
+            congestion: Congestion::from_config(recovery_config, now),
 
             newly_acked: Vec::new(),
         }
@@ -416,7 +416,7 @@ impl Recovery {
 
     #[cfg(test)]
     pub fn new(config: &Config) -> Self {
-        Self::new_with_config(&RecoveryConfig::from_config(config))
+        Self::new_with_config(&RecoveryConfig::from_config(config), Instant::now())
     }
 
     /// Returns whether or not we should elicit an ACK even if we wouldn't
@@ -736,7 +736,7 @@ impl Recovery {
     }
 
     pub fn pmtud_update_max_datagram_size(
-        &mut self, new_max_datagram_size: usize,
+        &mut self, new_max_datagram_size: usize, now: Instant
     ) {
         // Congestion Window is updated only when it's not updated already.
         // Update cwnd if it hasn't been updated yet.
@@ -754,14 +754,16 @@ impl Recovery {
             0,
             new_max_datagram_size,
             self.congestion.pacer.max_pacing_rate(),
+            now
         );
 
         self.max_datagram_size = new_max_datagram_size;
     }
 
-    pub fn update_max_datagram_size(&mut self, new_max_datagram_size: usize) {
+    pub fn update_max_datagram_size(&mut self, new_max_datagram_size: usize, now: Instant) {
         self.pmtud_update_max_datagram_size(
             self.max_datagram_size.min(new_max_datagram_size),
+            now
         )
     }
 

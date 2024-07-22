@@ -30,7 +30,7 @@ extern crate log;
 use std::net;
 
 use std::collections::HashMap;
-
+use std::time::Instant;
 use ring::rand::*;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -115,12 +115,15 @@ fn main() {
     let local_addr = socket.local_addr().unwrap();
 
     loop {
+        let now = Instant::now();
         // Find the shorter timeout from all the active connections.
         //
         // TODO: use event loop that properly supports timers
-        let timeout = clients.values().filter_map(|c| c.conn.timeout()).min();
+        let timeout = clients.values().filter_map(|c| c.conn.timeout(now)).min();
 
         poll.poll(&mut events, timeout).unwrap();
+
+        let now = Instant::now();
 
         // Read incoming UDP packets from the socket and feed them to quiche,
         // until there are no more packets to read.
@@ -131,7 +134,7 @@ fn main() {
             if events.is_empty() {
                 debug!("timed out");
 
-                clients.values_mut().for_each(|c| c.conn.on_timeout());
+                clients.values_mut().for_each(|c| c.conn.on_timeout(now));
 
                 break 'read;
             }
@@ -267,6 +270,7 @@ fn main() {
                     local_addr,
                     from,
                     &mut config,
+                    now,
                 )
                 .unwrap();
 
@@ -292,7 +296,7 @@ fn main() {
             };
 
             // Process potentially coalesced packets.
-            let read = match client.conn.recv(pkt_buf, recv_info) {
+            let read = match client.conn.recv(pkt_buf, recv_info, now) {
                 Ok(v) => v,
 
                 Err(e) => {
@@ -336,12 +340,14 @@ fn main() {
             }
         }
 
+        let now = Instant::now();
+
         // Generate outgoing QUIC packets for all active connections and send
         // them on the UDP socket, until quiche reports that there are no more
         // packets to be sent.
         for client in clients.values_mut() {
             loop {
-                let (write, send_info) = match client.conn.send(&mut out) {
+                let (write, send_info) = match client.conn.send(&mut out, now) {
                     Ok(v) => v,
 
                     Err(quiche::Error::Done) => {

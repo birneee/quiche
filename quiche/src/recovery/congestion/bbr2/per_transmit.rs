@@ -26,8 +26,6 @@
 
 use super::*;
 
-use std::time::Instant;
-
 // BBR2 Functions when trasmitting packets.
 //
 // 4.2.2.  Per-Transmit Steps

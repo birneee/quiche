@@ -28,17 +28,15 @@ use self::rtt::INITIAL_RTT;
 
 use super::*;
 
-use std::time::Instant;
-
 // BBR Functions at Initialization.
 //
 
 // 4.3.1.  Initialization Steps
-pub fn bbr_init(r: &mut Congestion) {
+pub fn bbr_init(r: &mut Congestion, now: Instant) {
     let bbr = &mut r.bbr_state;
 
     bbr.rtprop = INITIAL_RTT;
-    bbr.rtprop_stamp = Instant::now();
+    bbr.rtprop_stamp = now;
     bbr.next_round_delivered = r.delivery_rate.delivered();
 
     r.send_quantum = r.max_datagram_size;

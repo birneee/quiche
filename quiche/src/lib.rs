@@ -416,7 +416,7 @@ use std::str::FromStr;
 
 use std::collections::HashSet;
 use std::collections::VecDeque;
-
+use std::time::Instant;
 use smallvec::SmallVec;
 
 /// The current QUIC wire version.
@@ -1590,9 +1590,9 @@ pub struct Connection {
 #[inline]
 pub fn accept(
     scid: &ConnectionId, odcid: Option<&ConnectionId>, local: SocketAddr,
-    peer: SocketAddr, config: &mut Config,
+    peer: SocketAddr, config: &mut Config, now: Instant
 ) -> Result<Connection> {
-    let conn = Connection::new(scid, odcid, local, peer, config, true)?;
+    let conn = Connection::new(scid, odcid, local, peer, config, true, now)?;
 
     Ok(conn)
 }
@@ -1618,9 +1618,9 @@ pub fn accept(
 #[inline]
 pub fn connect(
     server_name: Option<&str>, scid: &ConnectionId, local: SocketAddr,
-    peer: SocketAddr, config: &mut Config,
+    peer: SocketAddr, config: &mut Config, now: Instant
 ) -> Result<Connection> {
-    let mut conn = Connection::new(scid, None, local, peer, config, false)?;
+    let mut conn = Connection::new(scid, None, local, peer, config, false, now)?;
 
     if let Some(server_name) = server_name {
         conn.handshake.set_host_name(server_name)?;
@@ -1814,15 +1814,15 @@ impl Default for QlogInfo {
 impl Connection {
     fn new(
         scid: &ConnectionId, odcid: Option<&ConnectionId>, local: SocketAddr,
-        peer: SocketAddr, config: &mut Config, is_server: bool,
+        peer: SocketAddr, config: &mut Config, is_server: bool, now: Instant
     ) -> Result<Connection> {
         let tls = config.tls_ctx.new_handshake()?;
-        Connection::with_tls(scid, odcid, local, peer, config, tls, is_server)
+        Connection::with_tls(scid, odcid, local, peer, config, tls, is_server, now)
     }
 
     fn with_tls(
         scid: &ConnectionId, odcid: Option<&ConnectionId>, local: SocketAddr,
-        peer: SocketAddr, config: &Config, tls: tls::Handshake, is_server: bool,
+        peer: SocketAddr, config: &Config, tls: tls::Handshake, is_server: bool, now: Instant,
     ) -> Result<Connection> {
         let max_rx_data = config.local_transport_params.initial_max_data;
 
@@ -1844,6 +1844,7 @@ impl Connection {
             config.path_challenge_recv_max_queue_len,
             MIN_CLIENT_INITIAL_LEN,
             true,
+            now
         );
 
         // If we did stateless retry assume the peer's address is verified.
@@ -1877,9 +1878,9 @@ impl Connection {
             trace_id: scid_as_hex.join(""),
 
             pkt_num_spaces: [
-                packet::PktNumSpace::new(),
-                packet::PktNumSpace::new(),
-                packet::PktNumSpace::new(),
+                packet::PktNumSpace::new(now),
+                packet::PktNumSpace::new(now),
+                packet::PktNumSpace::new(now),
             ],
 
             peer_transport_params: TransportParams::default(),
@@ -2083,9 +2084,9 @@ impl Connection {
     #[cfg_attr(docsrs, doc(cfg(feature = "qlog")))]
     pub fn set_qlog(
         &mut self, writer: Box<dyn std::io::Write + Send + Sync>, title: String,
-        description: String,
+        description: String, now: Instant
     ) {
-        self.set_qlog_with_level(writer, title, description, QlogLevel::Base)
+        self.set_qlog_with_level(writer, title, description, QlogLevel::Base, now)
     }
 
     /// Sets qlog output to the designated [`Writer`].
@@ -2101,7 +2102,7 @@ impl Connection {
     #[cfg_attr(docsrs, doc(cfg(feature = "qlog")))]
     pub fn set_qlog_with_level(
         &mut self, writer: Box<dyn std::io::Write + Send + Sync>, title: String,
-        description: String, qlog_level: QlogLevel,
+        description: String, qlog_level: QlogLevel, now: Instant,
     ) {
         let vp = if self.is_server {
             qlog::VantagePointType::Server
@@ -2139,7 +2140,7 @@ impl Connection {
             Some(title),
             Some(description),
             None,
-            time::Instant::now(),
+            now,
             trace,
             self.qlog.level,
             writer,
@@ -2174,7 +2175,7 @@ impl Connection {
     ///
     /// [`session()`]: struct.Connection.html#method.session
     #[inline]
-    pub fn set_session(&mut self, session: &[u8]) -> Result<()> {
+    pub fn set_session(&mut self, session: &[u8], now: Instant) -> Result<()> {
         let mut b = octets::Octets::with_slice(session);
 
         let session_len = b.get_u64()? as usize;
@@ -2188,7 +2189,7 @@ impl Connection {
         let peer_params =
             TransportParams::decode(raw_params_bytes.as_ref(), self.is_server)?;
 
-        self.process_peer_transport_params(peer_params)?;
+        self.process_peer_transport_params(peer_params, now)?;
 
         Ok(())
     }
@@ -2235,7 +2236,7 @@ impl Connection {
     /// }
     /// # Ok::<(), quiche::Error>(())
     /// ```
-    pub fn recv(&mut self, buf: &mut [u8], info: RecvInfo) -> Result<usize> {
+    pub fn recv(&mut self, buf: &mut [u8], info: RecvInfo, now: Instant) -> Result<usize> {
         let len = buf.len();
 
         if len == 0 {
@@ -2282,6 +2283,7 @@ impl Connection {
                 &mut buf[len - left..len],
                 &info,
                 recv_pid,
+                now
             ) {
                 Ok(v) => v,
 
@@ -2312,12 +2314,12 @@ impl Connection {
         // Even though the packet was previously "accepted", it
         // should be safe to forward the error, as it also comes
         // from the `recv()` method.
-        self.process_undecrypted_0rtt_packets()?;
+        self.process_undecrypted_0rtt_packets(now)?;
 
         Ok(done)
     }
 
-    fn process_undecrypted_0rtt_packets(&mut self) -> Result<()> {
+    fn process_undecrypted_0rtt_packets(&mut self, now: Instant) -> Result<()> {
         // Process previously undecryptable 0-RTT packets if the decryption key
         // is now available.
         if self.pkt_num_spaces[packet::Epoch::Application]
@@ -2326,7 +2328,7 @@ impl Connection {
         {
             while let Some((mut pkt, info)) = self.undecryptable_pkts.pop_front()
             {
-                if let Err(e) = self.recv(&mut pkt, info) {
+                if let Err(e) = self.recv(&mut pkt, info, now) {
                     self.undecryptable_pkts.clear();
 
                     return Err(e);
@@ -2375,10 +2377,8 @@ impl Connection {
     ///
     /// [`Done`]: enum.Error.html#variant.Done
     fn recv_single(
-        &mut self, buf: &mut [u8], info: &RecvInfo, recv_pid: Option<usize>,
+        &mut self, buf: &mut [u8], info: &RecvInfo, recv_pid: Option<usize>, now: Instant
     ) -> Result<usize> {
-        let now = time::Instant::now();
-
         if buf.is_empty() {
             return Err(Error::Done);
         }
@@ -2754,7 +2754,7 @@ impl Connection {
         // existing path.
         let recv_pid = if hdr.ty == packet::Type::Short && self.got_peer_conn_id {
             let pkt_dcid = ConnectionId::from_ref(&hdr.dcid);
-            self.get_or_create_recv_path_id(recv_pid, &pkt_dcid, buf_len, info)?
+            self.get_or_create_recv_path_id(recv_pid, &pkt_dcid, buf_len, info, now)?
         } else {
             // During handshake, we are on the initial path.
             self.paths.get_active_path_id()?
@@ -3091,7 +3091,7 @@ impl Connection {
                 );
 
                 p.recovery
-                    .pmtud_update_max_datagram_size(p.pmtud.get_current());
+                    .pmtud_update_max_datagram_size(p.pmtud.get_current(), now);
             }
         }
 
@@ -3241,8 +3241,8 @@ impl Connection {
     /// }
     /// # Ok::<(), quiche::Error>(())
     /// ```
-    pub fn send(&mut self, out: &mut [u8]) -> Result<(usize, SendInfo)> {
-        self.send_on_path(out, None, None)
+    pub fn send(&mut self, out: &mut [u8], now: Instant) -> Result<(usize, SendInfo)> {
+        self.send_on_path(out, None, None, now)
     }
 
     /// Writes a single QUIC packet to be sent to the peer from the specified
@@ -3330,7 +3330,7 @@ impl Connection {
     /// ```
     pub fn send_on_path(
         &mut self, out: &mut [u8], from: Option<SocketAddr>,
-        to: Option<SocketAddr>,
+        to: Option<SocketAddr>, now: Instant,
     ) -> Result<(usize, SendInfo)> {
         if out.is_empty() {
             return Err(Error::BufferTooShort);
@@ -3339,8 +3339,6 @@ impl Connection {
         if self.is_closed() || self.is_draining() {
             return Err(Error::Done);
         }
-
-        let now = time::Instant::now();
 
         if self.local_error.is_none() {
             self.do_handshake(now)?;
@@ -3352,7 +3350,7 @@ impl Connection {
         //
         // We simply fall-through to sending packets, which should
         // take care of terminating the connection as needed.
-        let _ = self.process_undecrypted_0rtt_packets();
+        let _ = self.process_undecrypted_0rtt_packets(now);
 
         // There's no point in trying to send a packet if the Initial secrets
         // have not been derived yet, so return early.
@@ -3387,7 +3385,7 @@ impl Connection {
                 send_path.pmtud.get_current()
             };
 
-            send_path.recovery.pmtud_update_max_datagram_size(size);
+            send_path.recovery.pmtud_update_max_datagram_size(size, now);
 
             left = cmp::min(out.len(), send_path.recovery.max_datagram_size());
         }
@@ -3756,7 +3754,7 @@ impl Connection {
                         .map_or(false, |le| le.is_app))) &&
             path.active()
         {
-            let ack_delay = pkt_space.largest_rx_pkt_time.elapsed();
+            let ack_delay = now - pkt_space.largest_rx_pkt_time;
 
             let ack_delay = ack_delay.as_micros() as u64 /
                 2_u64
@@ -4664,7 +4662,7 @@ impl Connection {
         if active_path.pmtud.is_enabled() {
             active_path
                 .recovery
-                .pmtud_update_max_datagram_size(active_path.pmtud.get_current());
+                .pmtud_update_max_datagram_size(active_path.pmtud.get_current(), now);
         }
 
         Ok((pkt_type, written))
@@ -5835,10 +5833,8 @@ impl Connection {
     /// be called. A timeout of `None` means that the timer should be disarmed.
     ///
     /// [`on_timeout()`]: struct.Connection.html#method.on_timeout
-    pub fn timeout(&self) -> Option<time::Duration> {
+    pub fn timeout(&self, now: Instant) -> Option<time::Duration> {
         self.timeout_instant().map(|timeout| {
-            let now = time::Instant::now();
-
             if timeout <= now {
                 time::Duration::ZERO
             } else {
@@ -5850,9 +5846,7 @@ impl Connection {
     /// Processes a timeout event.
     ///
     /// If no timeout has occurred it does nothing.
-    pub fn on_timeout(&mut self) {
-        let now = time::Instant::now();
-
+    pub fn on_timeout(&mut self, now: Instant) {
         if let Some(draining_timer) = self.draining_timer {
             if draining_timer <= now {
                 trace!("{} draining timeout expired", self.trace_id);
@@ -5967,12 +5961,12 @@ impl Connection {
     /// [`send()`]: struct.Connection.html#method.send
     /// [`send_on_path()`]: struct.Connection.html#method.send_on_path
     pub fn probe_path(
-        &mut self, local_addr: SocketAddr, peer_addr: SocketAddr,
+        &mut self, local_addr: SocketAddr, peer_addr: SocketAddr, now: Instant
     ) -> Result<u64> {
         // We may want to probe an existing path.
         let pid = match self.paths.path_id_from_addrs(&(local_addr, peer_addr)) {
             Some(pid) => pid,
-            None => self.create_path_on_client(local_addr, peer_addr)?,
+            None => self.create_path_on_client(local_addr, peer_addr, now)?,
         };
 
         let path = self.paths.get_mut(pid)?;
@@ -5989,9 +5983,9 @@ impl Connection {
     /// See [`migrate()`] for the full specification of this method.
     ///
     /// [`migrate()`]: struct.Connection.html#method.migrate
-    pub fn migrate_source(&mut self, local_addr: SocketAddr) -> Result<u64> {
+    pub fn migrate_source(&mut self, local_addr: SocketAddr, now: Instant) -> Result<u64> {
         let peer_addr = self.paths.get_active()?.peer_addr();
-        self.migrate(local_addr, peer_addr)
+        self.migrate(local_addr, peer_addr, now)
     }
 
     /// Migrates the connection over the given network path between `local_addr`
@@ -6009,7 +6003,7 @@ impl Connection {
     /// [`OutOfIdentifiers`]: enum.Error.html#OutOfIdentifiers
     /// [`InvalidState`]: enum.Error.html#InvalidState
     pub fn migrate(
-        &mut self, local_addr: SocketAddr, peer_addr: SocketAddr,
+        &mut self, local_addr: SocketAddr, peer_addr: SocketAddr, now: Instant
     ) -> Result<u64> {
         if self.is_server {
             return Err(Error::InvalidState);
@@ -6053,7 +6047,7 @@ impl Connection {
 
             (pid, dcid_seq)
         } else {
-            let pid = self.create_path_on_client(local_addr, peer_addr)?;
+            let pid = self.create_path_on_client(local_addr, peer_addr, now)?;
 
             let dcid_seq = self
                 .paths
@@ -6065,7 +6059,7 @@ impl Connection {
         };
 
         // Change the active path.
-        self.set_active_path(pid, time::Instant::now())?;
+        self.set_active_path(pid, now)?;
 
         Ok(dcid_seq)
     }
@@ -6622,7 +6616,7 @@ impl Connection {
     }
 
     fn parse_peer_transport_params(
-        &mut self, peer_params: TransportParams,
+        &mut self, peer_params: TransportParams, now: Instant
     ) -> Result<()> {
         // Validate initial_source_connection_id.
         match &peer_params.initial_source_connection_id {
@@ -6667,7 +6661,7 @@ impl Connection {
             }
         }
 
-        self.process_peer_transport_params(peer_params)?;
+        self.process_peer_transport_params(peer_params, now)?;
 
         self.parsed_peer_transport_params = true;
 
@@ -6675,7 +6669,7 @@ impl Connection {
     }
 
     fn process_peer_transport_params(
-        &mut self, peer_params: TransportParams,
+        &mut self, peer_params: TransportParams, now: Instant
     ) -> Result<()> {
         self.max_tx_data = peer_params.initial_max_data;
 
@@ -6702,10 +6696,12 @@ impl Connection {
                     .pmtud
                     .get_probe_size()
                     .min(peer_params.max_udp_payload_size as usize),
+                now
             );
         } else {
             active_path.recovery.update_max_datagram_size(
                 peer_params.max_udp_payload_size as usize,
+                now
             );
         }
 
@@ -6758,7 +6754,7 @@ impl Connection {
                     let peer_params =
                         TransportParams::decode(raw_params, self.is_server)?;
 
-                    self.parse_peer_transport_params(peer_params)?;
+                    self.parse_peer_transport_params(peer_params, now)?;
                 }
 
                 return Ok(());
@@ -6777,7 +6773,7 @@ impl Connection {
             let peer_params =
                 TransportParams::decode(raw_params, self.is_server)?;
 
-            self.parse_peer_transport_params(peer_params)?;
+            self.parse_peer_transport_params(peer_params, now)?;
         }
 
         if self.handshake_completed {
@@ -7547,7 +7543,7 @@ impl Connection {
     /// one if no existing path matches.
     fn get_or_create_recv_path_id(
         &mut self, recv_pid: Option<usize>, dcid: &ConnectionId, buf_len: usize,
-        info: &RecvInfo,
+        info: &RecvInfo, now: Instant
     ) -> Result<usize> {
         let ids = &mut self.ids;
 
@@ -7637,6 +7633,7 @@ impl Connection {
             self.path_challenge_recv_max_queue_len,
             MIN_CLIENT_INITIAL_LEN,
             false,
+            now,
         );
 
         path.max_send_bytes = buf_len * self.max_amplification_factor;
@@ -7736,7 +7733,7 @@ impl Connection {
 
     /// Creates a new client-side path.
     fn create_path_on_client(
-        &mut self, local_addr: SocketAddr, peer_addr: SocketAddr,
+        &mut self, local_addr: SocketAddr, peer_addr: SocketAddr, now: Instant
     ) -> Result<usize> {
         if self.is_server {
             return Err(Error::InvalidState);
@@ -7766,6 +7763,7 @@ impl Connection {
             self.path_challenge_recv_max_queue_len,
             MIN_CLIENT_INITIAL_LEN,
             false,
+            now,
         );
         path.active_dcid_seq = Some(dcid_seq);
 
@@ -8469,6 +8467,7 @@ pub mod testing {
                     client_addr,
                     server_addr,
                     config,
+                    Instant::now()
                 )?,
                 server: accept(
                     &server_scid,
@@ -8476,6 +8475,7 @@ pub mod testing {
                     server_addr,
                     client_addr,
                     config,
+                    Instant::now()
                 )?,
             })
         }
@@ -8500,6 +8500,7 @@ pub mod testing {
                     client_addr,
                     server_addr,
                     config,
+                    Instant::now(),
                 )?,
                 server: accept(
                     &server_scid,
@@ -8507,6 +8508,7 @@ pub mod testing {
                     server_addr,
                     client_addr,
                     config,
+                    Instant::now(),
                 )?,
             })
         }
@@ -8540,6 +8542,7 @@ pub mod testing {
                     client_addr,
                     server_addr,
                     client_config,
+                    Instant::now(),
                 )?,
                 server: accept(
                     &server_scid,
@@ -8547,6 +8550,7 @@ pub mod testing {
                     server_addr,
                     client_addr,
                     &mut config,
+                    Instant::now(),
                 )?,
             })
         }
@@ -8578,6 +8582,7 @@ pub mod testing {
                     client_addr,
                     server_addr,
                     &mut config,
+                    Instant::now(),
                 )?,
                 server: accept(
                     &server_scid,
@@ -8585,6 +8590,7 @@ pub mod testing {
                     server_addr,
                     client_addr,
                     server_config,
+                    Instant::now(),
                 )?,
             })
         }
@@ -8609,6 +8615,7 @@ pub mod testing {
                     client_addr,
                     server_addr,
                     client_config,
+                    Instant::now(),
                 )?,
                 server: accept(
                     &server_scid,
@@ -8616,6 +8623,7 @@ pub mod testing {
                     server_addr,
                     client_addr,
                     server_config,
+                    Instant::now(),
                 )?,
             })
         }
@@ -8664,7 +8672,7 @@ pub mod testing {
                 from: server_path.local_addr(),
             };
 
-            self.client.recv(buf, info)
+            self.client.recv(buf, info, Instant::now())
         }
 
         pub fn server_recv(&mut self, buf: &mut [u8]) -> Result<usize> {
@@ -8674,7 +8682,7 @@ pub mod testing {
                 from: client_path.local_addr(),
             };
 
-            self.server.recv(buf, info)
+            self.server.recv(buf, info, Instant::now())
         }
 
         pub fn send_pkt_to_server(
@@ -8727,11 +8735,11 @@ pub mod testing {
             from: active_path.peer_addr(),
         };
 
-        conn.recv(&mut buf[..len], info)?;
+        conn.recv(&mut buf[..len], info, Instant::now())?;
 
         let mut off = 0;
 
-        match conn.send(&mut buf[off..]) {
+        match conn.send(&mut buf[off..], Instant::now()) {
             Ok((write, _)) => off += write,
 
             Err(Error::Done) => (),
@@ -8751,7 +8759,7 @@ pub mod testing {
                 from: si.from,
             };
 
-            conn.recv(&mut pkt, info)?;
+            conn.recv(&mut pkt, info, Instant::now())?;
         }
 
         Ok(())
@@ -8766,7 +8774,7 @@ pub mod testing {
         loop {
             let mut out = vec![0u8; out_size];
 
-            let info = match conn.send_on_path(&mut out, from, to) {
+            let info = match conn.send_on_path(&mut out, from, to, Instant::now()) {
                 Ok((written, info)) => {
                     out.truncate(written);
                     info
@@ -9067,7 +9075,7 @@ mod tests {
 
         let mut pipe = testing::Pipe::with_client_config(&mut config).unwrap();
 
-        let (mut len, _) = pipe.client.send(&mut buf).unwrap();
+        let (mut len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
 
         let hdr = packet::Header::from_slice(&mut buf[..len], 0).unwrap();
         len = crate::negotiate_version(&hdr.scid, &hdr.dcid, &mut buf).unwrap();
@@ -9192,7 +9200,7 @@ mod tests {
         assert_eq!(pipe.client.encode_transport_params(), Ok(()));
 
         // Client sends initial flight.
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
 
         // Server rejects transport parameters.
         assert_eq!(
@@ -9214,7 +9222,7 @@ mod tests {
         assert_eq!(pipe.client.encode_transport_params(), Ok(()));
 
         // Client sends initial flight.
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
 
         // Server rejects transport parameters.
         assert_eq!(
@@ -9368,7 +9376,7 @@ mod tests {
 
         let mut pipe = testing::Pipe::with_server_config(&mut config).unwrap();
 
-        assert_eq!(pipe.client.set_session(session), Ok(()));
+        assert_eq!(pipe.client.set_session(session, Instant::now()), Ok(()));
         assert_eq!(pipe.handshake(), Ok(()));
 
         assert!(pipe.client.is_established());
@@ -9395,10 +9403,10 @@ mod tests {
         assert_eq!(pipe.server.application_proto(), b"");
 
         // Server should only send one packet in response to ALPN mismatch.
-        let (len, _) = pipe.server.send(&mut buf).unwrap();
+        let (len, _) = pipe.server.send(&mut buf, Instant::now()).unwrap();
         assert_eq!(len, 1200);
 
-        assert_eq!(pipe.server.send(&mut buf), Err(Error::Done));
+        assert_eq!(pipe.server.send(&mut buf, Instant::now()), Err(Error::Done));
         assert_eq!(pipe.server.sent_count, 1);
     }
 
@@ -9433,10 +9441,10 @@ mod tests {
 
         // Configure session on new connection.
         let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
-        assert_eq!(pipe.client.set_session(session), Ok(()));
+        assert_eq!(pipe.client.set_session(session, Instant::now()), Ok(()));
 
         // Client sends initial flight.
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
         assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(len));
 
         // Client sends 0-RTT packet.
@@ -9495,10 +9503,10 @@ mod tests {
 
         // Configure session on new connection.
         let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
-        assert_eq!(pipe.client.set_session(session), Ok(()));
+        assert_eq!(pipe.client.set_session(session, Instant::now()), Ok(()));
 
         // Client sends initial flight.
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
         let mut initial = buf[..len].to_vec();
 
         // Client sends 0-RTT packet.
@@ -9567,10 +9575,10 @@ mod tests {
 
         // Configure session on new connection.
         let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
-        assert_eq!(pipe.client.set_session(session), Ok(()));
+        assert_eq!(pipe.client.set_session(session, Instant::now()), Ok(()));
 
         // Client sends initial flight.
-        pipe.client.send(&mut buf).unwrap();
+        pipe.client.send(&mut buf, Instant::now()).unwrap();
 
         // Client sends 0-RTT packet.
         let pkt_type = packet::Type::ZeroRTT;
@@ -9639,11 +9647,11 @@ mod tests {
         };
 
         assert_eq!(
-            pipe.server.recv(&mut buf[..written], info),
+            pipe.server.recv(&mut buf[..written], info, Instant::now()),
             Err(Error::CryptoBufferExceeded)
         );
 
-        let written = match pipe.server.send(&mut buf) {
+        let written = match pipe.server.send(&mut buf, Instant::now()) {
             Ok((write, _)) => write,
 
             Err(_) => unreachable!(),
@@ -9768,10 +9776,10 @@ mod tests {
 
         // Configure session on new connection.
         let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
-        assert_eq!(pipe.client.set_session(session), Ok(()));
+        assert_eq!(pipe.client.set_session(session, Instant::now()), Ok(()));
 
         // Client sends initial flight.
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
         let mut initial = buf[..len].to_vec();
 
         assert!(pipe.client.is_in_early_data());
@@ -9779,7 +9787,7 @@ mod tests {
         // Client sends 0-RTT data.
         assert_eq!(pipe.client.stream_send(4, b"hello, world", true), Ok(12));
 
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
         let mut zrtt = buf[..len].to_vec();
 
         // Server receives packets.
@@ -10039,7 +10047,7 @@ mod tests {
         // Artificially limit the amount of bytes the server can send.
         initial_path.max_send_bytes = 60;
 
-        assert_eq!(pipe.server.send(&mut buf), Err(Error::Done));
+        assert_eq!(pipe.server.send(&mut buf, Instant::now()), Err(Error::Done));
     }
 
     #[test]
@@ -11359,7 +11367,7 @@ mod tests {
         let mut r = pipe.server.readable();
         assert_eq!(r.next(), None);
 
-        let (len, _) = pipe.server.send(&mut buf).unwrap();
+        let (len, _) = pipe.server.send(&mut buf, Instant::now()).unwrap();
 
         let mut dummy = buf[..len].to_vec();
 
@@ -11436,7 +11444,7 @@ mod tests {
         assert_eq!(r.next(), None);
 
         // Server has nothing to send.
-        assert_eq!(pipe.server.send(&mut buf), Err(Error::Done));
+        assert_eq!(pipe.server.send(&mut buf, Instant::now()), Err(Error::Done));
 
         assert_eq!(pipe.advance(), Ok(()));
 
@@ -11567,7 +11575,7 @@ mod tests {
         let mut r = pipe.server.writable();
         assert_eq!(r.next(), None);
 
-        let (len, _) = pipe.server.send(&mut buf).unwrap();
+        let (len, _) = pipe.server.send(&mut buf, Instant::now()).unwrap();
 
         let mut dummy = buf[..len].to_vec();
 
@@ -11705,7 +11713,7 @@ mod tests {
         assert_eq!(pipe.client.stream_send(0, b"aaaaa", false), Ok(5));
         assert_eq!(pipe.client.stream_send(4, b"aaaaa", false), Ok(5));
 
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
 
         let frames =
             testing::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
@@ -11723,7 +11731,7 @@ mod tests {
             })
         );
 
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
 
         let frames =
             testing::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
@@ -11736,7 +11744,7 @@ mod tests {
             })
         );
 
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
 
         let frames =
             testing::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
@@ -11996,7 +12004,7 @@ mod tests {
         // cannot be authenticated during decryption).
         buf[written - 1] = !buf[written - 1];
 
-        assert_eq!(pipe.server.timeout(), None);
+        assert_eq!(pipe.server.timeout(Instant::now()), None);
 
         assert_eq!(
             pipe.server_recv(&mut buf[..written]),
@@ -12014,7 +12022,7 @@ mod tests {
         let mut pipe = testing::Pipe::new().unwrap();
 
         // Client sends initial flight.
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
 
         // Server sends initial flight.
         assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(1200));
@@ -12109,7 +12117,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(pipe.server.timeout(), None);
+        assert_eq!(pipe.server.timeout(Instant::now()), None);
 
         assert_eq!(
             pipe.server_recv(&mut buf[..written]),
@@ -12694,7 +12702,7 @@ mod tests {
         let mut pipe = testing::Pipe::with_server_config(&mut config).unwrap();
 
         // Client sends initial flight.
-        let (mut len, _) = pipe.client.send(&mut buf).unwrap();
+        let (mut len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
 
         // Server sends Retry packet.
         let hdr = Header::from_slice(&mut buf[..len], MAX_CONN_ID_LEN).unwrap();
@@ -12720,7 +12728,7 @@ mod tests {
         // Client receives Retry and sends new Initial.
         assert_eq!(pipe.client_recv(&mut buf[..len]), Ok(len));
 
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
 
         let hdr = Header::from_slice(&mut buf[..len], MAX_CONN_ID_LEN).unwrap();
         assert_eq!(&hdr.token.unwrap(), token);
@@ -12733,6 +12741,7 @@ mod tests {
             testing::Pipe::server_addr(),
             from,
             &mut config,
+            Instant::now(),
         )
         .unwrap();
         assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(len));
@@ -12761,7 +12770,7 @@ mod tests {
         let mut pipe = testing::Pipe::with_server_config(&mut config).unwrap();
 
         // Client sends initial flight.
-        let (mut len, _) = pipe.client.send(&mut buf).unwrap();
+        let (mut len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
 
         // Server sends Retry packet.
         let hdr = Header::from_slice(&mut buf[..len], MAX_CONN_ID_LEN).unwrap();
@@ -12785,13 +12794,13 @@ mod tests {
         // Client receives Retry and sends new Initial.
         assert_eq!(pipe.client_recv(&mut buf[..len]), Ok(len));
 
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
 
         // Server accepts connection and send first flight. But original
         // destination connection ID is ignored.
         let from = "127.0.0.1:1234".parse().unwrap();
         pipe.server =
-            accept(&scid, None, testing::Pipe::server_addr(), from, &mut config)
+            accept(&scid, None, testing::Pipe::server_addr(), from, &mut config, Instant::now())
                 .unwrap();
         assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(len));
 
@@ -12821,7 +12830,7 @@ mod tests {
         let mut pipe = testing::Pipe::with_server_config(&mut config).unwrap();
 
         // Client sends initial flight.
-        let (mut len, _) = pipe.client.send(&mut buf).unwrap();
+        let (mut len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
 
         // Server sends Retry packet.
         let hdr = Header::from_slice(&mut buf[..len], MAX_CONN_ID_LEN).unwrap();
@@ -12845,7 +12854,7 @@ mod tests {
         // Client receives Retry and sends new Initial.
         assert_eq!(pipe.client_recv(&mut buf[..len]), Ok(len));
 
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
 
         // Server accepts connection and send first flight. But original
         // destination connection ID is invalid.
@@ -12857,6 +12866,7 @@ mod tests {
             testing::Pipe::server_addr(),
             from,
             &mut config,
+            Instant::now(),
         )
         .unwrap();
         assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(len));
@@ -12961,7 +12971,7 @@ mod tests {
         assert_eq!(pipe.client.stream_send(8, b"aaaaaaaaaaa", false), Ok(10));
         assert_eq!(pipe.client.blocked_limit, Some(30));
 
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
         assert_eq!(pipe.client.blocked_limit, None);
 
         let frames =
@@ -12998,7 +13008,7 @@ mod tests {
         assert_eq!(pipe.client.stream_send(0, b"aaaaaa", false), Ok(5));
         assert_eq!(pipe.client.streams.blocked().len(), 1);
 
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
         assert_eq!(pipe.client.streams.blocked().len(), 0);
 
         let frames =
@@ -13031,7 +13041,7 @@ mod tests {
         // again.
         assert_eq!(pipe.client.stream_send(4, b"a", false), Ok(1));
 
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
         assert_eq!(pipe.client.streams.blocked().len(), 0);
 
         let frames =
@@ -13056,7 +13066,7 @@ mod tests {
             Err(Error::Done)
         );
         assert_eq!(pipe.client.streams.blocked().len(), 0);
-        assert_eq!(pipe.client.send(&mut buf), Err(Error::Done));
+        assert_eq!(pipe.client.send(&mut buf, Instant::now()), Err(Error::Done));
     }
 
     #[test]
@@ -13081,13 +13091,13 @@ mod tests {
         // No matter how many times we try to write stream data tried, no
         // packets containing STREAM_BLOCKED should be emitted.
         assert_eq!(pipe.client.stream_send(0, b"h", false), Err(Error::Done));
-        assert_eq!(pipe.client.send(&mut buf), Err(Error::Done));
+        assert_eq!(pipe.client.send(&mut buf, Instant::now()), Err(Error::Done));
 
         assert_eq!(pipe.client.stream_send(0, b"h", false), Err(Error::Done));
-        assert_eq!(pipe.client.send(&mut buf), Err(Error::Done));
+        assert_eq!(pipe.client.send(&mut buf, Instant::now()), Err(Error::Done));
 
         assert_eq!(pipe.client.stream_send(0, b"h", false), Err(Error::Done));
-        assert_eq!(pipe.client.send(&mut buf), Err(Error::Done));
+        assert_eq!(pipe.client.send(&mut buf, Instant::now()), Err(Error::Done));
 
         // Now read some data at the server to release flow control.
         let mut r = pipe.server.readable();
@@ -13102,7 +13112,7 @@ mod tests {
         assert_eq!(pipe.client.stream_send(0, b"hhhhhhhhhh!", false), Ok(10));
         assert_eq!(pipe.client.streams.blocked().len(), 1);
 
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
         assert_eq!(pipe.client.streams.blocked().len(), 0);
 
         let frames =
@@ -13122,7 +13132,7 @@ mod tests {
 
         assert_eq!(pipe.client.stream_send(0, b"!", false), Err(Error::Done));
         assert_eq!(pipe.client.streams.blocked().len(), 0);
-        assert_eq!(pipe.client.send(&mut buf), Err(Error::Done));
+        assert_eq!(pipe.client.send(&mut buf, Instant::now()), Err(Error::Done));
     }
 
     #[test]
@@ -13249,7 +13259,7 @@ mod tests {
 
         let mut buf = [0; 2000];
 
-        let ret = pipe.client.send(&mut buf);
+        let ret = pipe.client.send(&mut buf, Instant::now());
 
         assert_eq!(pipe.client.tx_cap, 0);
 
@@ -13316,7 +13326,7 @@ mod tests {
                 .expect("client recv ping");
 
             // Client acknowledges despite a full congestion window
-            let ret = pipe.client.send(&mut buf);
+            let ret = pipe.client.send(&mut buf, Instant::now());
 
             assert!(matches!(ret, Ok((_, _))), "the client should at least send one packet to acknowledge the newly received data");
 
@@ -13341,7 +13351,7 @@ mod tests {
         // The client shouldn't need to send any more packets after the ACK only
         // packet it just sent.
         assert_eq!(
-            pipe.client.send(&mut buf),
+            pipe.client.send(&mut buf, Instant::now()),
             Err(Error::Done),
             "nothing for client to send after ACK-only packet"
         );
@@ -13624,7 +13634,7 @@ mod tests {
 
         for _ in 1..=3 {
             let (len, _) =
-                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE]).unwrap();
+                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE], Instant::now()).unwrap();
 
             let frames =
                 testing::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
@@ -13647,7 +13657,7 @@ mod tests {
 
         for _ in 1..=3 {
             let (len, _) =
-                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE]).unwrap();
+                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE], Instant::now()).unwrap();
 
             let frames =
                 testing::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
@@ -13670,7 +13680,7 @@ mod tests {
 
         for _ in 1..=3 {
             let (len, _) =
-                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE]).unwrap();
+                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE], Instant::now()).unwrap();
 
             let frames =
                 testing::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
@@ -13693,7 +13703,7 @@ mod tests {
 
         for _ in 1..=3 {
             let (len, _) =
-                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE]).unwrap();
+                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE], Instant::now()).unwrap();
 
             let frames =
                 testing::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
@@ -13707,7 +13717,7 @@ mod tests {
             );
 
             let (len, _) =
-                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE]).unwrap();
+                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE], Instant::now()).unwrap();
 
             let frames =
                 testing::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
@@ -13731,7 +13741,7 @@ mod tests {
 
         for _ in 1..=3 {
             let (len, _) =
-                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE]).unwrap();
+                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE], Instant::now()).unwrap();
 
             let frames =
                 testing::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
@@ -13749,7 +13759,7 @@ mod tests {
             };
         }
 
-        assert_eq!(pipe.server.send(&mut buf), Err(Error::Done));
+        assert_eq!(pipe.server.send(&mut buf, Instant::now()), Err(Error::Done));
     }
 
     #[test]
@@ -13812,7 +13822,7 @@ mod tests {
         assert_eq!(pipe.server.stream_priority(0, 20, true), Ok(()));
 
         // First is stream 8.
-        let (len, _) = pipe.server.send(&mut buf).unwrap();
+        let (len, _) = pipe.server.send(&mut buf, Instant::now()).unwrap();
 
         let frames =
             testing::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
@@ -13826,7 +13836,7 @@ mod tests {
         );
 
         // Then is stream 0.
-        let (len, _) = pipe.server.send(&mut buf).unwrap();
+        let (len, _) = pipe.server.send(&mut buf, Instant::now()).unwrap();
 
         let frames =
             testing::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
@@ -13840,7 +13850,7 @@ mod tests {
         );
 
         // Then are stream 12 and 4, with the same priority.
-        let (len, _) = pipe.server.send(&mut buf).unwrap();
+        let (len, _) = pipe.server.send(&mut buf, Instant::now()).unwrap();
 
         let frames =
             testing::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
@@ -13853,7 +13863,7 @@ mod tests {
             })
         );
 
-        let (len, _) = pipe.server.send(&mut buf).unwrap();
+        let (len, _) = pipe.server.send(&mut buf, Instant::now()).unwrap();
 
         let frames =
             testing::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
@@ -13866,7 +13876,7 @@ mod tests {
             })
         );
 
-        assert_eq!(pipe.server.send(&mut buf), Err(Error::Done));
+        assert_eq!(pipe.server.send(&mut buf, Instant::now()), Err(Error::Done));
     }
 
     #[test]
@@ -13936,7 +13946,7 @@ mod tests {
         for _ in 1..=3 {
             // DATAGRAM
             let (len, _) =
-                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE]).unwrap();
+                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE], Instant::now()).unwrap();
 
             let frames =
                 testing::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
@@ -13949,7 +13959,7 @@ mod tests {
 
             // STREAM 0
             let (len, _) =
-                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE]).unwrap();
+                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE], Instant::now()).unwrap();
 
             let frames =
                 testing::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
@@ -13970,7 +13980,7 @@ mod tests {
 
             // DATAGRAM
             let (len, _) =
-                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE]).unwrap();
+                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE], Instant::now()).unwrap();
 
             let frames =
                 testing::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
@@ -13983,7 +13993,7 @@ mod tests {
 
             // STREAM 4
             let (len, _) =
-                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE]).unwrap();
+                pipe.server.send(&mut buf[..MAX_TEST_PACKET_SIZE], Instant::now()).unwrap();
 
             let frames =
                 testing::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
@@ -14018,13 +14028,13 @@ mod tests {
 
         // Client sends more stream data, but packet is lost
         assert_eq!(pipe.client.stream_send(4, b"b", false), Ok(1));
-        assert!(pipe.client.send(&mut buf).is_ok());
+        assert!(pipe.client.send(&mut buf, Instant::now()).is_ok());
 
         // Wait until PTO expires. Since the RTT is very low, wait a bit more.
-        let timer = pipe.client.timeout().unwrap();
+        let timer = pipe.client.timeout(Instant::now()).unwrap();
         std::thread::sleep(timer + time::Duration::from_millis(1));
 
-        pipe.client.on_timeout();
+        pipe.client.on_timeout(Instant::now());
 
         let epoch = packet::Epoch::Application;
         assert_eq!(
@@ -14038,7 +14048,7 @@ mod tests {
         );
 
         // Client retransmits stream data in PTO probe.
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
         assert_eq!(
             pipe.client
                 .paths
@@ -14075,14 +14085,14 @@ mod tests {
         let mut pipe = testing::Pipe::new().unwrap();
 
         // Client sends Initial packet.
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
         assert_eq!(len, 1200);
 
         // Wait for PTO to expire.
-        let timer = pipe.client.timeout().unwrap();
+        let timer = pipe.client.timeout(Instant::now()).unwrap();
         std::thread::sleep(timer + time::Duration::from_millis(1));
 
-        pipe.client.on_timeout();
+        pipe.client.on_timeout(Instant::now());
 
         let epoch = packet::Epoch::Initial;
         assert_eq!(
@@ -14096,7 +14106,7 @@ mod tests {
         );
 
         // Client sends PTO probe.
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
         assert_eq!(len, 1200);
         assert_eq!(
             pipe.client
@@ -14109,10 +14119,10 @@ mod tests {
         );
 
         // Wait for PTO to expire.
-        let timer = pipe.client.timeout().unwrap();
+        let timer = pipe.client.timeout(Instant::now()).unwrap();
         std::thread::sleep(timer + time::Duration::from_millis(1));
 
-        pipe.client.on_timeout();
+        pipe.client.on_timeout(Instant::now());
 
         assert_eq!(
             pipe.client
@@ -14125,7 +14135,7 @@ mod tests {
         );
 
         // Client sends first PTO probe.
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
         assert_eq!(len, 1200);
         assert_eq!(
             pipe.client
@@ -14138,7 +14148,7 @@ mod tests {
         );
 
         // Client sends second PTO probe.
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
         assert_eq!(len, 1200);
         assert_eq!(
             pipe.client
@@ -14158,16 +14168,16 @@ mod tests {
         let mut pipe = testing::Pipe::new().unwrap();
 
         // Client sends first flight.
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
         assert_eq!(len, MIN_CLIENT_INITIAL_LEN);
         assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(len));
 
         // Server sends first flight.
-        let (len, _) = pipe.server.send(&mut buf).unwrap();
+        let (len, _) = pipe.server.send(&mut buf, Instant::now()).unwrap();
         assert_eq!(len, MIN_CLIENT_INITIAL_LEN);
         assert_eq!(pipe.client_recv(&mut buf[..len]), Ok(len));
 
-        let (len, _) = pipe.server.send(&mut buf).unwrap();
+        let (len, _) = pipe.server.send(&mut buf, Instant::now()).unwrap();
         assert_eq!(pipe.client_recv(&mut buf[..len]), Ok(len));
 
         // Client sends stream data.
@@ -14175,7 +14185,7 @@ mod tests {
         assert_eq!(pipe.client.stream_send(4, b"hello", true), Ok(5));
 
         // Client sends second flight.
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
         assert_eq!(len, MIN_CLIENT_INITIAL_LEN);
         assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(len));
 
@@ -14208,7 +14218,7 @@ mod tests {
         assert!(pipe.server.handshake_status().peer_verified_address);
 
         // Client sends padded Initial.
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
         assert_eq!(len, 1200);
 
         // Server receives client's Initial and sends own Initial and Handshake
@@ -14232,7 +14242,7 @@ mod tests {
         assert!(pipe.server.handshake_status().peer_verified_address);
 
         // Make sure client's PTO timer is armed.
-        assert!(pipe.client.timeout().is_some());
+        assert!(pipe.client.timeout(Instant::now()).is_some());
     }
 
     #[test]
@@ -14244,7 +14254,7 @@ mod tests {
         let mut pipe = testing::Pipe::new().unwrap();
 
         // Client sends padded Initial.
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
         assert_eq!(len, 1200);
 
         // Server receives client's Initial and sends own Initial and Handshake.
@@ -14333,7 +14343,7 @@ mod tests {
             .app_limited());
         assert_eq!(pipe.client.dgram_send_queue.byte_size(), 1_000_000);
 
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
 
         assert_ne!(pipe.client.dgram_send_queue.byte_size(), 0);
         assert_ne!(pipe.client.dgram_send_queue.byte_size(), 1_000_000);
@@ -14718,7 +14728,7 @@ mod tests {
             Err(Error::Done)
         );
 
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
 
         let frames =
             testing::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
@@ -14744,7 +14754,7 @@ mod tests {
 
         assert_eq!(pipe.client.close(true, 0x4321, b"hello!"), Err(Error::Done));
 
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut buf, Instant::now()).unwrap();
 
         let frames =
             testing::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
@@ -15019,6 +15029,7 @@ mod tests {
                 client_addr,
                 server_addr,
                 &mut client_config,
+                Instant::now(),
             )
             .unwrap(),
             server: accept(
@@ -15027,6 +15038,7 @@ mod tests {
                 server_addr,
                 client_addr,
                 &mut server_config,
+                Instant::now(),
             )
             .unwrap(),
         };
@@ -15239,14 +15251,14 @@ mod tests {
         assert_eq!(pipe.server.stream_send(4, &buf, false), Err(Error::Done));
 
         // Wait for PTO to expire.
-        let timer = pipe.server.timeout().unwrap();
+        let timer = pipe.server.timeout(Instant::now()).unwrap();
         std::thread::sleep(timer + time::Duration::from_millis(1));
 
-        pipe.server.on_timeout();
+        pipe.server.on_timeout(Instant::now());
 
         // Server sends PTO probe (not limited to cwnd),
         // to update last_tx_data.
-        let (len, _) = pipe.server.send(&mut buf).unwrap();
+        let (len, _) = pipe.server.send(&mut buf, Instant::now()).unwrap();
         assert_eq!(len, 1200);
 
         // Client sends STOP_SENDING to decrease tx_data
@@ -15367,11 +15379,11 @@ mod tests {
         };
 
         assert_eq!(
-            pipe.server.recv(&mut buf[..written], info),
+            pipe.server.recv(&mut buf[..written], info, Instant::now()),
             Err(Error::InvalidFrame)
         );
 
-        let written = match pipe.server.send(&mut buf) {
+        let written = match pipe.server.send(&mut buf, Instant::now()) {
             Ok((write, _)) => write,
 
             Err(_) => unreachable!(),
@@ -15438,11 +15450,11 @@ mod tests {
         };
 
         assert_eq!(
-            pipe.server.recv(&mut buf[..written], info),
+            pipe.server.recv(&mut buf[..written], info, Instant::now()),
             Err(Error::InvalidFrame)
         );
 
-        let written = match pipe.server.send(&mut buf) {
+        let written = match pipe.server.send(&mut buf, Instant::now()) {
             Ok((write, _)) => write,
 
             Err(_) => unreachable!(),
@@ -15576,10 +15588,10 @@ mod tests {
         testing::emit_flight(&mut pipe.client).unwrap();
 
         // Wait until timer expires. Since the RTT is very low, wait a bit more.
-        let timer = pipe.client.timeout().unwrap();
+        let timer = pipe.client.timeout(Instant::now()).unwrap();
         std::thread::sleep(timer + time::Duration::from_millis(1));
 
-        pipe.client.on_timeout();
+        pipe.client.on_timeout(Instant::now());
 
         // Let exchange packets over the connection.
         assert_eq!(pipe.advance(), Ok(()));
@@ -15594,10 +15606,10 @@ mod tests {
         testing::emit_flight(&mut pipe.server).unwrap();
 
         // Wait until timer expires. Since the RTT is very low, wait a bit more.
-        let timer = pipe.server.timeout().unwrap();
+        let timer = pipe.server.timeout(Instant::now()).unwrap();
         std::thread::sleep(timer + time::Duration::from_millis(1));
 
-        pipe.server.on_timeout();
+        pipe.server.on_timeout(Instant::now());
 
         // Let exchange packets over the connection.
         assert_eq!(pipe.advance(), Ok(()));
@@ -15715,11 +15727,11 @@ mod tests {
         };
 
         assert_eq!(
-            pipe.server.recv(&mut buf[..written], info),
+            pipe.server.recv(&mut buf[..written], info, Instant::now()),
             Err(Error::IdLimit)
         );
 
-        let written = match pipe.server.send(&mut buf) {
+        let written = match pipe.server.send(&mut buf, Instant::now()) {
             Ok((write, _)) => write,
 
             Err(_) => unreachable!(),
@@ -15822,7 +15834,7 @@ mod tests {
 
         // We cannot probe a new path if there are not enough identifiers.
         assert_eq!(
-            pipe.client.probe_path(client_addr_2, server_addr),
+            pipe.client.probe_path(client_addr_2, server_addr, Instant::now()),
             Err(Error::OutOfIdentifiers)
         );
 
@@ -15835,7 +15847,7 @@ mod tests {
 
         // We need to exchange the CIDs first.
         assert_eq!(
-            pipe.client.probe_path(client_addr_2, server_addr),
+            pipe.client.probe_path(client_addr_2, server_addr, Instant::now()),
             Err(Error::OutOfIdentifiers)
         );
 
@@ -15848,11 +15860,11 @@ mod tests {
         assert_eq!(pipe.client.path_event_next(), None);
 
         // Now the path probing can work.
-        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr, Instant::now()), Ok(1));
 
         // But the server cannot probe a yet-unseen path.
         assert_eq!(
-            pipe.server.probe_path(server_addr, client_addr_2),
+            pipe.server.probe_path(server_addr, client_addr_2, Instant::now()),
             Err(Error::InvalidState),
         );
 
@@ -15877,7 +15889,7 @@ mod tests {
         assert_eq!(pipe.server.path_event_next(), None);
 
         // The server can later probe the path again.
-        assert_eq!(pipe.server.probe_path(server_addr, client_addr_2), Ok(1));
+        assert_eq!(pipe.server.probe_path(server_addr, client_addr_2, Instant::now()), Ok(1));
 
         // This should not trigger any event at client side.
         assert_eq!(pipe.client.path_event_next(), None);
@@ -15903,7 +15915,7 @@ mod tests {
 
         let server_addr = testing::Pipe::server_addr();
         let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
-        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr, Instant::now()), Ok(1));
 
         // The client creates the PATH CHALLENGE, but it is lost.
         testing::emit_flight(&mut pipe.client).unwrap();
@@ -15926,7 +15938,7 @@ mod tests {
         let timer = probe_instant.duration_since(time::Instant::now());
         std::thread::sleep(timer + time::Duration::from_millis(1));
 
-        pipe.client.on_timeout();
+        pipe.client.on_timeout(Instant::now());
 
         assert_eq!(pipe.advance(), Ok(()));
 
@@ -15968,7 +15980,7 @@ mod tests {
 
         let server_addr = testing::Pipe::server_addr();
         let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
-        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr, Instant::now()), Ok(1));
 
         for _ in 0..MAX_PROBING_TIMEOUTS {
             // The client creates the PATH CHALLENGE, but it is always lost.
@@ -15992,7 +16004,7 @@ mod tests {
             let timer = probe_instant.duration_since(time::Instant::now());
             std::thread::sleep(timer + time::Duration::from_millis(1));
 
-            pipe.client.on_timeout();
+            pipe.client.on_timeout(Instant::now());
         }
 
         assert_eq!(
@@ -16053,7 +16065,7 @@ mod tests {
 
         let server_addr = testing::Pipe::server_addr();
         let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
-        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr, Instant::now()), Ok(1));
         // Limited MTU of 1199 bytes for some reason.
         testing::process_flight(
             &mut pipe.server,
@@ -16106,7 +16118,7 @@ mod tests {
 
         let server_addr = testing::Pipe::server_addr();
         let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
-        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr, Instant::now()), Ok(1));
 
         assert_eq!(pipe.advance(), Ok(()));
 
@@ -16132,7 +16144,7 @@ mod tests {
 
         // Now forge a packet reusing the unverified path's CID over another
         // 4-tuple.
-        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr, Instant::now()), Ok(1));
         let client_addr_3 = "127.0.0.1:9012".parse().unwrap();
         let mut flight =
             testing::emit_flight(&mut pipe.client).expect("no generated packet");
@@ -16171,7 +16183,7 @@ mod tests {
         let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
         let server_addr = testing::Pipe::server_addr();
         let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
-        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr, Instant::now()), Ok(1));
 
         assert_eq!(pipe.client.retire_dcid(0), Err(Error::OutOfIdentifiers));
     }
@@ -16200,7 +16212,7 @@ mod tests {
         let server_addr = testing::Pipe::server_addr();
         let client_addr = testing::Pipe::client_addr();
         let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
-        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr, Instant::now()), Ok(1));
 
         let mut buf = [0; 65535];
         // There is nothing to send on the initial path.
@@ -16208,7 +16220,8 @@ mod tests {
             pipe.client.send_on_path(
                 &mut buf,
                 Some(client_addr),
-                Some(server_addr)
+                Some(server_addr),
+                Instant::now(),
             ),
             Err(Error::Done)
         );
@@ -16216,7 +16229,7 @@ mod tests {
         // Client should send padded PATH_CHALLENGE.
         let (sent, si) = pipe
             .client
-            .send_on_path(&mut buf, Some(client_addr_2), Some(server_addr))
+            .send_on_path(&mut buf, Some(client_addr_2), Some(server_addr), Instant::now())
             .expect("No error");
         assert_eq!(sent, MIN_CLIENT_INITIAL_LEN);
         assert_eq!(si.from, client_addr_2);
@@ -16226,7 +16239,7 @@ mod tests {
             to: si.to,
             from: si.from,
         };
-        assert_eq!(pipe.server.recv(&mut buf[..sent], ri), Ok(sent));
+        assert_eq!(pipe.server.recv(&mut buf[..sent], ri, Instant::now()), Ok(sent));
 
         let stats = pipe.server.stats();
         assert_eq!(stats.path_challenge_rx_count, 1);
@@ -16238,7 +16251,8 @@ mod tests {
             pipe.client.send_on_path(
                 &mut buf,
                 Some(client_addr_3),
-                Some(server_addr)
+                Some(server_addr),
+                Instant::now()
             ),
             Err(Error::InvalidState)
         );
@@ -16246,21 +16260,22 @@ mod tests {
             pipe.client.send_on_path(
                 &mut buf,
                 Some(client_addr),
-                Some(server_addr_2)
+                Some(server_addr_2),
+                Instant::now()
             ),
             Err(Error::InvalidState)
         );
 
         // Let's introduce some additional path challenges and data exchange.
-        assert_eq!(pipe.client.probe_path(client_addr, server_addr_2), Ok(2));
-        assert_eq!(pipe.client.probe_path(client_addr_3, server_addr), Ok(3));
+        assert_eq!(pipe.client.probe_path(client_addr, server_addr_2, Instant::now()), Ok(2));
+        assert_eq!(pipe.client.probe_path(client_addr_3, server_addr, Instant::now()), Ok(3));
         // Just to fit in two packets.
         assert_eq!(pipe.client.stream_send(0, &buf[..1201], true), Ok(1201));
 
         // PATH_CHALLENGE
         let (sent, si) = pipe
             .client
-            .send_on_path(&mut buf, Some(client_addr), None)
+            .send_on_path(&mut buf, Some(client_addr), None, Instant::now())
             .expect("No error");
         assert_eq!(sent, MIN_CLIENT_INITIAL_LEN);
         assert_eq!(si.from, client_addr);
@@ -16270,7 +16285,7 @@ mod tests {
             to: si.to,
             from: si.from,
         };
-        assert_eq!(pipe.server.recv(&mut buf[..sent], ri), Ok(sent));
+        assert_eq!(pipe.server.recv(&mut buf[..sent], ri, Instant::now()), Ok(sent));
 
         let stats = pipe.server.stats();
         assert_eq!(stats.path_challenge_rx_count, 2);
@@ -16278,7 +16293,7 @@ mod tests {
         // STREAM frame on active path.
         let (sent, si) = pipe
             .client
-            .send_on_path(&mut buf, Some(client_addr), None)
+            .send_on_path(&mut buf, Some(client_addr), None, Instant::now())
             .expect("No error");
         assert_eq!(si.from, client_addr);
         assert_eq!(si.to, server_addr);
@@ -16287,7 +16302,7 @@ mod tests {
             to: si.to,
             from: si.from,
         };
-        assert_eq!(pipe.server.recv(&mut buf[..sent], ri), Ok(sent));
+        assert_eq!(pipe.server.recv(&mut buf[..sent], ri, Instant::now()), Ok(sent));
 
         let stats = pipe.server.stats();
         assert_eq!(stats.path_challenge_rx_count, 2);
@@ -16295,7 +16310,7 @@ mod tests {
         // PATH_CHALLENGE
         let (sent, si) = pipe
             .client
-            .send_on_path(&mut buf, None, Some(server_addr))
+            .send_on_path(&mut buf, None, Some(server_addr), Instant::now())
             .expect("No error");
         assert_eq!(sent, MIN_CLIENT_INITIAL_LEN);
         assert_eq!(si.from, client_addr_3);
@@ -16305,7 +16320,7 @@ mod tests {
             to: si.to,
             from: si.from,
         };
-        assert_eq!(pipe.server.recv(&mut buf[..sent], ri), Ok(sent));
+        assert_eq!(pipe.server.recv(&mut buf[..sent], ri, Instant::now()), Ok(sent));
 
         let stats = pipe.server.stats();
         assert_eq!(stats.path_challenge_rx_count, 3);
@@ -16313,7 +16328,7 @@ mod tests {
         // STREAM frame on active path.
         let (sent, si) = pipe
             .client
-            .send_on_path(&mut buf, None, Some(server_addr))
+            .send_on_path(&mut buf, None, Some(server_addr), Instant::now())
             .expect("No error");
         assert_eq!(si.from, client_addr);
         assert_eq!(si.to, server_addr);
@@ -16322,15 +16337,15 @@ mod tests {
             to: si.to,
             from: si.from,
         };
-        assert_eq!(pipe.server.recv(&mut buf[..sent], ri), Ok(sent));
+        assert_eq!(pipe.server.recv(&mut buf[..sent], ri, Instant::now()), Ok(sent));
 
         // No more data to exchange leads to Error::Done.
         assert_eq!(
-            pipe.client.send_on_path(&mut buf, Some(client_addr), None),
+            pipe.client.send_on_path(&mut buf, Some(client_addr), None, Instant::now()),
             Err(Error::Done)
         );
         assert_eq!(
-            pipe.client.send_on_path(&mut buf, None, Some(server_addr)),
+            pipe.client.send_on_path(&mut buf, None, Some(server_addr), Instant::now()),
             Err(Error::Done)
         );
 
@@ -16393,7 +16408,7 @@ mod tests {
 
         // Case 1: the client first probes the new address, the server too, and
         // then migrates.
-        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr, Instant::now()), Ok(1));
         assert_eq!(pipe.advance(), Ok(()));
         assert_eq!(
             pipe.client.path_event_next(),
@@ -16418,10 +16433,10 @@ mod tests {
         );
         // The server can never initiates the connection migration.
         assert_eq!(
-            pipe.server.migrate(server_addr, client_addr_2),
+            pipe.server.migrate(server_addr, client_addr_2, Instant::now()),
             Err(Error::InvalidState)
         );
-        assert_eq!(pipe.client.migrate(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.client.migrate(client_addr_2, server_addr, Instant::now()), Ok(1));
         assert_eq!(pipe.client.stream_send(0, b"data", true), Ok(4));
         assert_eq!(pipe.advance(), Ok(()));
         assert_eq!(
@@ -16464,7 +16479,7 @@ mod tests {
 
         // Case 2: the client migrates on a path that was not previously
         // validated, and has spare SCIDs/DCIDs to do so.
-        assert_eq!(pipe.client.migrate(client_addr_3, server_addr), Ok(2));
+        assert_eq!(pipe.client.migrate(client_addr_3, server_addr, Instant::now()), Ok(2));
         assert_eq!(pipe.client.stream_send(4, b"data", true), Ok(4));
         assert_eq!(pipe.advance(), Ok(()));
         assert_eq!(
@@ -16515,7 +16530,7 @@ mod tests {
 
         // Case 3: the client tries to migrate on the current active path.
         // This is not an error, but it triggers nothing.
-        assert_eq!(pipe.client.migrate(client_addr_3, server_addr), Ok(2));
+        assert_eq!(pipe.client.migrate(client_addr_3, server_addr, Instant::now()), Ok(2));
         assert_eq!(pipe.client.stream_send(8, b"data", true), Ok(4));
         assert_eq!(pipe.advance(), Ok(()));
         assert_eq!(pipe.client.path_event_next(), None);
@@ -16556,7 +16571,7 @@ mod tests {
         // Case 4: the client tries to migrate on a path that was not previously
         // validated, and has no spare SCIDs/DCIDs. Prevent active migration.
         assert_eq!(
-            pipe.client.migrate(client_addr_4, server_addr),
+            pipe.client.migrate(client_addr_4, server_addr, Instant::now()),
             Err(Error::OutOfIdentifiers)
         );
         assert_eq!(
@@ -16604,7 +16619,7 @@ mod tests {
 
         // The client migrates on a path that was not previously
         // validated, and has spare SCIDs/DCIDs to do so.
-        assert_eq!(pipe.client.migrate(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.client.migrate(client_addr_2, server_addr, Instant::now()), Ok(1));
         assert_eq!(pipe.client.stream_send(4, b"data", true), Ok(4));
         assert_eq!(pipe.advance(), Ok(()));
         assert_eq!(
@@ -16680,7 +16695,7 @@ mod tests {
         let server_addr = testing::Pipe::server_addr();
         let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
 
-        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr, Instant::now()), Ok(1));
         assert_eq!(pipe.advance(), Ok(()));
         assert_eq!(
             pipe.client.path_event_next(),
@@ -16814,7 +16829,7 @@ mod tests {
         let timer = probe_instant.duration_since(time::Instant::now());
         std::thread::sleep(timer + time::Duration::from_millis(1));
 
-        pipe.server.on_timeout();
+        pipe.server.on_timeout(Instant::now());
 
         // Because of the small ACK size, the server cannot send more to the
         // client. Fallback on the previous active path.
@@ -16902,7 +16917,7 @@ mod tests {
 
         // Make sure ping is sent
         let mut buf = [0; 1500];
-        let (len, _) = pipe.server.send(&mut buf).unwrap();
+        let (len, _) = pipe.server.send(&mut buf, Instant::now()).unwrap();
 
         let frames =
             testing::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
@@ -16926,7 +16941,7 @@ mod tests {
 
         // Make sure ping is not sent
         let mut buf = [0; 1500];
-        let (len, _) = pipe.server.send(&mut buf).unwrap();
+        let (len, _) = pipe.server.send(&mut buf, Instant::now()).unwrap();
 
         let frames =
             testing::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
@@ -17220,7 +17235,7 @@ mod tests {
             .recv(&mut pkt_buf[..written], RecvInfo {
                 to: server_addr,
                 from: client_addr_2,
-            })
+            }, Instant::now())
             .expect("server receive path challenge");
 
         // Show that the new path is not considered a destination path by quiche

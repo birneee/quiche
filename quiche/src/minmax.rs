@@ -76,10 +76,10 @@ impl<T> Deref for Minmax<T> {
 }
 
 impl<T: PartialOrd + Copy> Minmax<T> {
-    pub fn new(val: T) -> Self {
+    pub fn new(val: T, now: Instant) -> Self {
         Minmax {
             estimate: [MinmaxSample {
-                time: Instant::now(),
+                time: now,
                 value: val,
             }; 3],
         }
@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn reset_filter_rtt() {
-        let mut f = Minmax::new(Duration::ZERO);
+        let mut f = Minmax::new(Duration::ZERO, Instant::now());
         let now = Instant::now();
         let rtt = Duration::from_millis(50);
 
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn reset_filter_bandwidth() {
-        let mut f = Minmax::new(0);
+        let mut f = Minmax::new(0, Instant::now());
         let now = Instant::now();
         let bw = 2000;
 
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn get_windowed_min_rtt() {
-        let mut f = Minmax::new(Duration::ZERO);
+        let mut f = Minmax::new(Duration::ZERO, Instant::now());
         let rtt_25 = Duration::from_millis(25);
         let rtt_24 = Duration::from_millis(24);
         let win = Duration::from_millis(500);
@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn get_windowed_min_bandwidth() {
-        let mut f = Minmax::new(0);
+        let mut f = Minmax::new(0, Instant::now());
         let bw_200 = 200;
         let bw_500 = 500;
         let win = Duration::from_millis(500);
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn get_windowed_max_rtt() {
-        let mut f = Minmax::new(Duration::ZERO);
+        let mut f = Minmax::new(Duration::ZERO, Instant::now());
         let rtt_25 = Duration::from_millis(25);
         let rtt_24 = Duration::from_millis(24);
         let win = Duration::from_millis(500);
@@ -293,7 +293,7 @@ mod tests {
 
     #[test]
     fn get_windowed_max_bandwidth() {
-        let mut f = Minmax::new(0);
+        let mut f = Minmax::new(0, Instant::now());
         let bw_200 = 200;
         let bw_500 = 500;
         let win = Duration::from_millis(500);
@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn get_windowed_min_estimates_rtt() {
-        let mut f = Minmax::new(Duration::ZERO);
+        let mut f = Minmax::new(Duration::ZERO, Instant::now());
         let rtt_25 = Duration::from_millis(25);
         let rtt_24 = Duration::from_millis(24);
         let rtt_23 = Duration::from_millis(23);
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn get_windowed_min_estimates_bandwidth() {
-        let mut f = Minmax::new(0);
+        let mut f = Minmax::new(0, Instant::now());
         let bw_500 = 500;
         let bw_400 = 400;
         let bw_300 = 300;
@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn get_windowed_max_estimates_rtt() {
-        let mut f = Minmax::new(Duration::ZERO);
+        let mut f = Minmax::new(Duration::ZERO, Instant::now());
         let rtt_25 = Duration::from_millis(25);
         let rtt_24 = Duration::from_millis(24);
         let rtt_23 = Duration::from_millis(23);
@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn get_windowed_max_estimates_bandwidth() {
-        let mut f = Minmax::new(0);
+        let mut f = Minmax::new(0, Instant::now());
         let bw_500 = 500;
         let bw_400 = 400;
         let bw_300 = 300;

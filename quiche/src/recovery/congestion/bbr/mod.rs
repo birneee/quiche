@@ -186,9 +186,7 @@ pub struct State {
 }
 
 impl State {
-    pub fn new() -> Self {
-        let now = Instant::now();
-
+    pub fn new(now: Instant) -> Self {
         State {
             state: BBRStateMachine::Startup,
 
@@ -196,7 +194,7 @@ impl State {
 
             btlbw: 0,
 
-            btlbwfilter: Minmax::new(0),
+            btlbwfilter: Minmax::new(0, now),
 
             rtprop: Duration::ZERO,
 
@@ -277,8 +275,8 @@ fn bbr_exit_recovery(r: &mut Congestion) {
 
 // Congestion Control Hooks.
 //
-fn on_init(r: &mut Congestion) {
-    init::bbr_init(r);
+fn on_init(r: &mut Congestion, now: Instant) {
+    init::bbr_init(r, now);
 }
 
 fn on_packet_sent(
@@ -358,7 +356,7 @@ mod tests {
     use smallvec::smallvec;
 
     fn test_sender() -> TestSender {
-        TestSender::new(recovery::CongestionControlAlgorithm::BBR, false)
+        TestSender::new(recovery::CongestionControlAlgorithm::BBR, false, Instant::now())
     }
 
     #[test]

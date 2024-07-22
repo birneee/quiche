@@ -77,7 +77,7 @@ pub struct Pacer {
 impl Pacer {
     pub fn new(
         enabled: bool, capacity: usize, rate: u64, max_datagram_size: usize,
-        max_pacing_rate: Option<u64>,
+        max_pacing_rate: Option<u64>, now: Instant,
     ) -> Self {
         // Round capacity to MSS.
         let capacity = capacity / max_datagram_size * max_datagram_size;
@@ -96,9 +96,9 @@ impl Pacer {
 
             rate: pacing_rate,
 
-            last_update: Instant::now(),
+            last_update: now,
 
-            next_time: Instant::now(),
+            next_time: now,
 
             max_datagram_size,
 
@@ -217,7 +217,7 @@ mod tests {
         let max_burst = datagram_size * 10;
         let pacing_rate = 100_000;
 
-        let mut p = Pacer::new(true, max_burst, pacing_rate, datagram_size, None);
+        let mut p = Pacer::new(true, max_burst, pacing_rate, datagram_size, None, Instant::now());
 
         let now = Instant::now();
 
@@ -250,7 +250,7 @@ mod tests {
         let max_burst = datagram_size * 10;
         let pacing_rate = 100_000;
 
-        let mut p = Pacer::new(true, max_burst, pacing_rate, datagram_size, None);
+        let mut p = Pacer::new(true, max_burst, pacing_rate, datagram_size, None, Instant::now());
 
         let now = Instant::now();
 
@@ -282,6 +282,7 @@ mod tests {
             pacing_rate,
             datagram_size,
             Some(max_pacing_rate),
+            Instant::now(),
         );
 
         let now = Instant::now();
