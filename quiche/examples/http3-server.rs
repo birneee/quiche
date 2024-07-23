@@ -271,7 +271,7 @@ fn main() {
                     local_addr,
                     from,
                     &mut config,
-                    Instant::now(),
+                    now,
                 )
                 .unwrap();
 

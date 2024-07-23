@@ -4805,8 +4805,7 @@ impl Connection {
                 raw: None,
             });
 
-            let now = time::Instant::now();
-            q.add_event_data_with_instant(ev_data, now).ok();
+            q.add_event_data_now(ev_data).ok();
         });
 
         if self.should_update_max_data() {
@@ -4994,8 +4993,7 @@ impl Connection {
                 raw: None,
             });
 
-            let now = time::Instant::now();
-            q.add_event_data_with_instant(ev_data, now).ok();
+            q.add_event_data_now(ev_data).ok();
         });
 
         if sent == 0 && !buf.is_empty() {
