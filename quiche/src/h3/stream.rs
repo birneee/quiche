@@ -35,6 +35,7 @@ pub const HTTP3_CONTROL_STREAM_TYPE_ID: u64 = 0x0;
 pub const HTTP3_PUSH_STREAM_TYPE_ID: u64 = 0x1;
 pub const QPACK_ENCODER_STREAM_TYPE_ID: u64 = 0x2;
 pub const QPACK_DECODER_STREAM_TYPE_ID: u64 = 0x3;
+pub const WEBTRANSPORT_STREAM_TYPE_ID: u64 = 0x54;
 
 const MAX_STATE_BUF_SIZE: usize = (1 << 24) - 1;
 
@@ -45,6 +46,7 @@ pub enum Type {
     Push,
     QpackEncoder,
     QpackDecoder,
+    WebTransport,
     Unknown,
 }
 
@@ -57,6 +59,7 @@ impl Type {
             Type::Push => qlog::events::h3::H3StreamType::Push,
             Type::QpackEncoder => qlog::events::h3::H3StreamType::QpackEncode,
             Type::QpackDecoder => qlog::events::h3::H3StreamType::QpackDecode,
+            Type::WebTransport => qlog::events::h3::H3StreamType::Unknown,
             Type::Unknown => qlog::events::h3::H3StreamType::Unknown,
         }
     }
@@ -90,6 +93,9 @@ pub enum State {
 
     /// All data has been read.
     Finished,
+
+    /// H3 ignores stream, must be handled by upper layer.
+    Ignore,
 }
 
 impl Type {
@@ -99,7 +105,7 @@ impl Type {
             HTTP3_PUSH_STREAM_TYPE_ID => Ok(Type::Push),
             QPACK_ENCODER_STREAM_TYPE_ID => Ok(Type::QpackEncoder),
             QPACK_DECODER_STREAM_TYPE_ID => Ok(Type::QpackDecoder),
-
+            WEBTRANSPORT_STREAM_TYPE_ID => Ok(Type::WebTransport),
             _ => Ok(Type::Unknown),
         }
     }
@@ -246,6 +252,7 @@ impl Stream {
             },
 
             Type::Unknown => State::Drain,
+            Type::WebTransport => State::Ignore,
         };
 
         self.state_transition(state, 1, true)?;
@@ -349,8 +356,25 @@ impl Stream {
                         (frame::MAX_PUSH_FRAME_TYPE_ID, _) =>
                             return Err(Error::FrameUnexpected),
 
+                        (frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID, _) => {
+                            self.ty = Some(Type::WebTransport);
+                            self.frame_type = Some(frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID);
+                            self.state = State::Ignore;
+                            return Ok(());
+                        }
+
                         // All other frames can be ignored regardless of stream
                         // state.
+                        _ => (),
+                    }
+                } else {
+                    match (ty, self.remote_initialized) {
+                        (frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID, _) => {
+                            self.ty = Some(Type::WebTransport);
+                            self.frame_type = Some(frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID);
+                            self.state = State::Ignore;
+                            return Ok(());
+                        }
                         _ => (),
                     }
                 }
