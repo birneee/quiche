@@ -1179,7 +1179,15 @@ impl Connection {
 
         Ok(if bidi {
             let stream_id = self.next_request_stream_id;
-            conn.stream_send(stream_id, octets::OctetsMut::with_slice(&mut [0u8; 8]).put_varint(frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID)?, false)?;
+            const HDR_LEN: usize = octets::varint_len(frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID);
+            let mut hdr = [0u8; HDR_LEN];
+            octets::OctetsMut::with_slice(&mut hdr).put_varint_with_len(frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID, HDR_LEN)?;
+
+            conn.stream_send(stream_id, &[], false)?; // only to create stream state
+            if conn.stream_capacity(stream_id)? < HDR_LEN {
+                return Err(Error::StreamBlocked);
+            }
+            conn.stream_send(stream_id, &hdr, false)?;
 
             let mut stream = stream::Stream::new(stream_id, true);
             stream.set_frame_type(frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID)?;
@@ -1195,7 +1203,15 @@ impl Connection {
             stream_id
         } else  {
             let stream_id = self.next_uni_stream_id;
-            conn.stream_send(stream_id, octets::OctetsMut::with_slice(&mut [0u8; 8]).put_varint(stream::WEBTRANSPORT_STREAM_TYPE_ID)?, false)?;
+            const HDR_LEN: usize = octets::varint_len(stream::WEBTRANSPORT_STREAM_TYPE_ID);
+            let mut hdr = [0u8; HDR_LEN];
+            octets::OctetsMut::with_slice(&mut hdr).put_varint_with_len(stream::WEBTRANSPORT_STREAM_TYPE_ID, HDR_LEN)?;
+
+            conn.stream_send(stream_id, &[], false)?; // only to create stream state
+            if conn.stream_capacity(stream_id)? < HDR_LEN {
+                return Err(Error::StreamBlocked);
+            }
+            conn.stream_send(stream_id, &hdr, false)?;
 
             let mut stream = stream::Stream::new(stream_id, true);
             stream.set_ty(stream::Type::WebTransport)?;
