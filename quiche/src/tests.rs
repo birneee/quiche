@@ -10046,3 +10046,77 @@ fn configuration_values_are_limited_to_max_varint() {
     // do not panic because of too large values that we try to encode via varint.
     assert_eq!(pipe.handshake(), Err(Error::InvalidTransportParam));
 }
+
+#[cfg(feature = "boringssl-boring-crate")]
+#[rstest]
+fn handshake_certificate_compression() {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use boring::ssl::{CertificateCompressionAlgorithm, CertificateCompressor};
+    use boring::ssl::{SslContextBuilder, SslMethod};
+
+    #[derive(Default, Clone)]
+    struct BrotliCompressor {
+        compress_count: Arc<AtomicUsize>,
+        decompress_count: Arc<AtomicUsize>,
+    }
+
+    impl CertificateCompressor for BrotliCompressor {
+        const ALGORITHM: CertificateCompressionAlgorithm = CertificateCompressionAlgorithm::BROTLI;
+        const CAN_COMPRESS: bool = true;
+        const CAN_DECOMPRESS: bool = true;
+
+        fn compress<W>(&self, input: &[u8], output: &mut W) -> std::io::Result<()>
+        where
+            W: Write,
+        {
+            let mut writer = brotli::CompressorWriter::new(output, 1024, 6, 17); // same values as https://github.com/josephnoir/quiche/blob/josephnoir/compression-with-print/quiche/src/tls.rs
+            writer.write_all(input)?;
+            self.compress_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn decompress<W>(&self, input: &[u8], output: &mut W) -> std::io::Result<()>
+        where
+            W: Write,
+        {
+            brotli::BrotliDecompress(&mut std::io::Cursor::new(input), output)?;
+            self.decompress_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let compressor = BrotliCompressor::default();
+
+    let mut c_config = {
+        let mut c = Config::with_boring_ssl_ctx_builder(PROTOCOL_VERSION, {
+            let mut b = SslContextBuilder::new(SslMethod::tls()).unwrap();
+            b.add_certificate_compression_algorithm(compressor.clone()).unwrap();
+            b
+        }).unwrap();
+        c.set_application_protos(&[b"proto1"]).unwrap();
+        c
+    };
+
+    let mut s_config = {
+        let mut c = Config::with_boring_ssl_ctx_builder(PROTOCOL_VERSION, {
+            let mut b = SslContextBuilder::new(SslMethod::tls()).unwrap();
+            b.set_certificate_chain_file("examples/cert.crt")
+                .unwrap();
+            b
+                .set_private_key_file("examples/cert.key", boring::ssl::SslFiletype::PEM)
+                .unwrap();
+            b.add_certificate_compression_algorithm(compressor.clone()).unwrap();
+            b
+        }).unwrap();
+        c.set_application_protos(&[b"proto1"]).unwrap();
+        c
+    };
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(&mut c_config, &mut s_config).unwrap();
+
+    pipe.handshake().unwrap();
+
+    assert_eq!(compressor.compress_count.load(Ordering::SeqCst), 1);
+    assert_eq!(compressor.decompress_count.load(Ordering::SeqCst), 1);
+}

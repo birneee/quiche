@@ -95,6 +95,7 @@ mio = { workspace = true, features = ["net", "os-poll"] }
 ring = { workspace = true }
 rstest = { workspace = true }
 url = { workspace = true }
+brotli = "8.0"
 
 [lib]
 crate-type = ["lib", "staticlib", "cdylib"]
