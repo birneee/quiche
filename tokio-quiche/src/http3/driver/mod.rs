@@ -39,6 +39,7 @@ use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::time::Instant;
 
 use datagram_socket::StreamClosureKind;
 use foundations::telemetry::log;
@@ -83,6 +84,7 @@ pub use self::client::ClientH3Driver;
 pub use self::client::ClientH3Event;
 pub use self::client::ClientRequestSender;
 pub use self::client::NewClientRequest;
+pub use self::server::RawPriorityValue;
 pub use self::server::ServerEventStream;
 pub use self::server::ServerH3Command;
 pub use self::server::ServerH3Controller;
@@ -636,7 +638,7 @@ impl<H: DriverHooks> H3Driver<H> {
             OutboundFrame::Headers(headers, priority) => {
                 let prio = priority.as_ref().unwrap_or(&DEFAULT_PRIO);
 
-                if ctx.initial_headers_sent {
+                let res = if ctx.initial_headers_sent {
                     // Initial headers were already sent, send additional
                     // headers now.
                     conn.send_additional_headers_with_priority(
@@ -648,7 +650,24 @@ impl<H: DriverHooks> H3Driver<H> {
                         qconn, stream_id, headers, prio, false,
                     )
                     .inspect(|_| ctx.initial_headers_sent = true)
+                };
+
+                if let Err(h3::Error::StreamBlocked) = res {
+                    ctx.first_full_headers_flush_fail_time
+                        .get_or_insert(Instant::now());
                 }
+
+                if res.is_ok() {
+                    if let Some(first) =
+                        ctx.first_full_headers_flush_fail_time.take()
+                    {
+                        ctx.audit_stats.add_header_flush_duration(
+                            Instant::now().duration_since(first),
+                        );
+                    }
+                }
+
+                res
             },
 
             OutboundFrame::Body(body, fin) => {
@@ -659,10 +678,12 @@ impl<H: DriverHooks> H3Driver<H> {
                     return Ok(());
                 }
                 if *fin {
-                    // If this is the last body frame, close the receiver in the
-                    // stream map to signal that we shouldn't
-                    // receive any more frames.
-                    ctx.recv.as_mut().expect("channel").close();
+                    // If this is the last body frame, drop the receiver in the
+                    // stream map to signal that we shouldn't receive any more
+                    // frames. NOTE: we can't use `mpsc::Receiver::close()`
+                    // due to an inconsistency in how tokio handles reading
+                    // from a closed mpsc channel https://github.com/tokio-rs/tokio/issues/7631
+                    ctx.recv = None;
                 }
                 #[cfg(feature = "zero-copy")]
                 let n = conn.send_body_zc(qconn, stream_id, body, *fin)?;
@@ -947,7 +968,9 @@ impl<H: DriverHooks> H3Driver<H> {
             }
 
             let Some(recv) = ctx.recv.as_mut() else {
-                return Ok(()); // This stream is already waiting for data
+                // This stream is already waiting for data or we wrote a fin and
+                // closed the channel.
+                return Ok(());
             };
 
             // Attempt to queue the next frame for processing. The corresponding
@@ -1102,11 +1125,6 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
             Some(dgram) = self.dgram_recv.recv() => self.dgram_ready(qconn, dgram),
             Some(cmd) = self.cmd_recv.recv() => H::conn_command(self, qconn, cmd),
             r = self.hooks.wait_for_action(qconn), if H::has_wait_action(self) => r,
-            _ = self.h3_event_sender.closed() => {
-                let _ = qconn.close(true, quiche::h3::WireErrorCode::NoError as u64, &[]);
-                // Allow the IOW to continue until quiche reports the connection closed.
-                Ok(())
-            }
         }?;
 
         // Make sure controller is not starved, but also not prioritized in the

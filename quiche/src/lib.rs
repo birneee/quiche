@@ -820,6 +820,7 @@ pub struct Config {
     cc_algorithm: CongestionControlAlgorithm,
     custom_bbr_params: Option<BbrParams>,
     initial_congestion_window_packets: usize,
+    enable_relaxed_loss_threshold: bool,
 
     pmtud: bool,
 
@@ -898,6 +899,7 @@ impl Config {
             custom_bbr_params: None,
             initial_congestion_window_packets:
                 DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS,
+            enable_relaxed_loss_threshold: false,
             pmtud: false,
             hystart: true,
             pacing: true,
@@ -1135,14 +1137,16 @@ impl Config {
     ///
     /// The default value is infinite, that is, no timeout is used.
     pub fn set_max_idle_timeout(&mut self, v: u64) {
-        self.local_transport_params.max_idle_timeout = v;
+        self.local_transport_params.max_idle_timeout =
+            cmp::min(v, octets::MAX_VAR_INT);
     }
 
     /// Sets the `max_udp_payload_size transport` parameter.
     ///
     /// The default value is `65527`.
     pub fn set_max_recv_udp_payload_size(&mut self, v: usize) {
-        self.local_transport_params.max_udp_payload_size = v as u64;
+        self.local_transport_params.max_udp_payload_size =
+            cmp::min(v as u64, octets::MAX_VAR_INT);
     }
 
     /// Sets the maximum outgoing UDP payload size.
@@ -1165,7 +1169,8 @@ impl Config {
     ///
     /// The default value is `0`.
     pub fn set_initial_max_data(&mut self, v: u64) {
-        self.local_transport_params.initial_max_data = v;
+        self.local_transport_params.initial_max_data =
+            cmp::min(v, octets::MAX_VAR_INT);
     }
 
     /// Sets the `initial_max_stream_data_bidi_local` transport parameter.
@@ -1183,7 +1188,8 @@ impl Config {
     /// The default value is `0`.
     pub fn set_initial_max_stream_data_bidi_local(&mut self, v: u64) {
         self.local_transport_params
-            .initial_max_stream_data_bidi_local = v;
+            .initial_max_stream_data_bidi_local =
+            cmp::min(v, octets::MAX_VAR_INT);
     }
 
     /// Sets the `initial_max_stream_data_bidi_remote` transport parameter.
@@ -1201,7 +1207,8 @@ impl Config {
     /// The default value is `0`.
     pub fn set_initial_max_stream_data_bidi_remote(&mut self, v: u64) {
         self.local_transport_params
-            .initial_max_stream_data_bidi_remote = v;
+            .initial_max_stream_data_bidi_remote =
+            cmp::min(v, octets::MAX_VAR_INT);
     }
 
     /// Sets the `initial_max_stream_data_uni` transport parameter.
@@ -1217,7 +1224,8 @@ impl Config {
     ///
     /// The default value is `0`.
     pub fn set_initial_max_stream_data_uni(&mut self, v: u64) {
-        self.local_transport_params.initial_max_stream_data_uni = v;
+        self.local_transport_params.initial_max_stream_data_uni =
+            cmp::min(v, octets::MAX_VAR_INT);
     }
 
     /// Sets the `initial_max_streams_bidi` transport parameter.
@@ -1238,7 +1246,8 @@ impl Config {
     ///
     /// The default value is `0`.
     pub fn set_initial_max_streams_bidi(&mut self, v: u64) {
-        self.local_transport_params.initial_max_streams_bidi = v;
+        self.local_transport_params.initial_max_streams_bidi =
+            cmp::min(v, octets::MAX_VAR_INT);
     }
 
     /// Sets the `initial_max_streams_uni` transport parameter.
@@ -1257,21 +1266,24 @@ impl Config {
     ///
     /// The default value is `0`.
     pub fn set_initial_max_streams_uni(&mut self, v: u64) {
-        self.local_transport_params.initial_max_streams_uni = v;
+        self.local_transport_params.initial_max_streams_uni =
+            cmp::min(v, octets::MAX_VAR_INT);
     }
 
     /// Sets the `ack_delay_exponent` transport parameter.
     ///
     /// The default value is `3`.
     pub fn set_ack_delay_exponent(&mut self, v: u64) {
-        self.local_transport_params.ack_delay_exponent = v;
+        self.local_transport_params.ack_delay_exponent =
+            cmp::min(v, octets::MAX_VAR_INT);
     }
 
     /// Sets the `max_ack_delay` transport parameter.
     ///
     /// The default value is `25`.
     pub fn set_max_ack_delay(&mut self, v: u64) {
-        self.local_transport_params.max_ack_delay = v;
+        self.local_transport_params.max_ack_delay =
+            cmp::min(v, octets::MAX_VAR_INT);
     }
 
     /// Sets the `active_connection_id_limit` transport parameter.
@@ -1279,7 +1291,8 @@ impl Config {
     /// The default value is `2`. Lower values will be ignored.
     pub fn set_active_connection_id_limit(&mut self, v: u64) {
         if v >= 2 {
-            self.local_transport_params.active_conn_id_limit = v;
+            self.local_transport_params.active_conn_id_limit =
+                cmp::min(v, octets::MAX_VAR_INT);
         }
     }
 
@@ -1334,6 +1347,13 @@ impl Config {
     /// The default value is 10.
     pub fn set_initial_congestion_window_packets(&mut self, packets: usize) {
         self.initial_congestion_window_packets = packets;
+    }
+
+    /// Configure whether to enable relaxed loss detection on spurious loss.
+    ///
+    /// The default value is false.
+    pub fn set_enable_relaxed_loss_threshold(&mut self, enable: bool) {
+        self.enable_relaxed_loss_threshold = enable;
     }
 
     /// Configures whether to enable HyStart++.
@@ -2366,7 +2386,8 @@ impl<F: BufFactory> Connection<F> {
     /// The default value is infinite, that is, no timeout is used unless
     /// already configured when creating the connection.
     pub fn set_max_idle_timeout(&mut self, v: u64) -> Result<()> {
-        self.local_transport_params.max_idle_timeout = v;
+        self.local_transport_params.max_idle_timeout =
+            cmp::min(v, octets::MAX_VAR_INT);
 
         self.encode_transport_params()
     }
@@ -2454,6 +2475,27 @@ impl<F: BufFactory> Connection<F> {
         let ex_data = tls::ExData::from_ssl_ref(ssl).ok_or(Error::TlsFail)?;
 
         ex_data.recovery_config.initial_congestion_window_packets = packets;
+
+        Ok(())
+    }
+
+    /// Configure whether to enable relaxed loss detection on spurious loss.
+    ///
+    /// This function can only be called inside one of BoringSSL's handshake
+    /// callbacks, before any packet has been sent. Calling this function any
+    /// other time will have no effect.
+    ///
+    /// See [`Config::set_enable_relaxed_loss_threshold()`].
+    ///
+    /// [`Config::set_enable_relaxed_loss_threshold()`]: struct.Config.html#method.set_enable_relaxed_loss_threshold
+    #[cfg(feature = "boringssl-boring-crate")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "boringssl-boring-crate")))]
+    pub fn set_enable_relaxed_loss_threshold_in_handshake(
+        ssl: &mut boring::ssl::SslRef, enable: bool,
+    ) -> Result<()> {
+        let ex_data = tls::ExData::from_ssl_ref(ssl).ok_or(Error::TlsFail)?;
+
+        ex_data.recovery_config.enable_relaxed_loss_threshold = enable;
 
         Ok(())
     }
@@ -5132,13 +5174,6 @@ impl<F: BufFactory> Connection<F> {
             self.ack_eliciting_sent = true;
         }
 
-        let active_path = self.paths.get_active_mut()?;
-        if let Some(pmtud) = active_path.pmtud.as_mut() {
-            active_path
-                .recovery
-                .pmtud_update_max_datagram_size(pmtud.get_current_mtu());
-        }
-
         Ok((pkt_type, written))
     }
 
@@ -7049,9 +7084,10 @@ impl<F: BufFactory> Connection<F> {
         ConnectionId::from_ref(e.cid.as_ref())
     }
 
-    /// Returns the PMTU for the active path if it exists. This requires no
-    /// additonal packets to be sent but simply checks if PMTUD has completed
-    /// and has found a valid PMTU.
+    /// Returns the PMTU for the active path if it exists.
+    ///
+    /// This requires no additonal packets to be sent but simply checks if PMTUD
+    /// has completed and has found a valid PMTU.
     #[inline]
     pub fn pmtu(&self) -> Option<usize> {
         if let Ok(path) = self.paths.get_active() {
@@ -9097,6 +9133,7 @@ impl TransportParams {
         };
 
         if tp.max_idle_timeout != 0 {
+            assert!(tp.max_idle_timeout <= octets::MAX_VAR_INT);
             TransportParams::encode_param(
                 &mut b,
                 0x0001,
@@ -9113,6 +9150,7 @@ impl TransportParams {
         }
 
         if tp.max_udp_payload_size != 0 {
+            assert!(tp.max_udp_payload_size <= octets::MAX_VAR_INT);
             TransportParams::encode_param(
                 &mut b,
                 0x0003,
@@ -9122,6 +9160,7 @@ impl TransportParams {
         }
 
         if tp.initial_max_data != 0 {
+            assert!(tp.initial_max_data <= octets::MAX_VAR_INT);
             TransportParams::encode_param(
                 &mut b,
                 0x0004,
@@ -9131,6 +9170,7 @@ impl TransportParams {
         }
 
         if tp.initial_max_stream_data_bidi_local != 0 {
+            assert!(tp.initial_max_stream_data_bidi_local <= octets::MAX_VAR_INT);
             TransportParams::encode_param(
                 &mut b,
                 0x0005,
@@ -9140,6 +9180,9 @@ impl TransportParams {
         }
 
         if tp.initial_max_stream_data_bidi_remote != 0 {
+            assert!(
+                tp.initial_max_stream_data_bidi_remote <= octets::MAX_VAR_INT
+            );
             TransportParams::encode_param(
                 &mut b,
                 0x0006,
@@ -9149,6 +9192,7 @@ impl TransportParams {
         }
 
         if tp.initial_max_stream_data_uni != 0 {
+            assert!(tp.initial_max_stream_data_uni <= octets::MAX_VAR_INT);
             TransportParams::encode_param(
                 &mut b,
                 0x0007,
@@ -9158,6 +9202,7 @@ impl TransportParams {
         }
 
         if tp.initial_max_streams_bidi != 0 {
+            assert!(tp.initial_max_streams_bidi <= octets::MAX_VAR_INT);
             TransportParams::encode_param(
                 &mut b,
                 0x0008,
@@ -9167,6 +9212,7 @@ impl TransportParams {
         }
 
         if tp.initial_max_streams_uni != 0 {
+            assert!(tp.initial_max_streams_uni <= octets::MAX_VAR_INT);
             TransportParams::encode_param(
                 &mut b,
                 0x0009,
@@ -9176,6 +9222,7 @@ impl TransportParams {
         }
 
         if tp.ack_delay_exponent != 0 {
+            assert!(tp.ack_delay_exponent <= octets::MAX_VAR_INT);
             TransportParams::encode_param(
                 &mut b,
                 0x000a,
@@ -9185,6 +9232,7 @@ impl TransportParams {
         }
 
         if tp.max_ack_delay != 0 {
+            assert!(tp.max_ack_delay <= octets::MAX_VAR_INT);
             TransportParams::encode_param(
                 &mut b,
                 0x000b,
@@ -9200,6 +9248,7 @@ impl TransportParams {
         // TODO: encode preferred_address
 
         if tp.active_conn_id_limit != 2 {
+            assert!(tp.active_conn_id_limit <= octets::MAX_VAR_INT);
             TransportParams::encode_param(
                 &mut b,
                 0x000e,
@@ -9221,6 +9270,7 @@ impl TransportParams {
         }
 
         if let Some(max_datagram_frame_size) = tp.max_datagram_frame_size {
+            assert!(max_datagram_frame_size <= octets::MAX_VAR_INT);
             TransportParams::encode_param(
                 &mut b,
                 0x0020,

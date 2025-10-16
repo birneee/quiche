@@ -107,6 +107,7 @@ impl QuicConnectionStats {
 
         datagram_socket::StartupExit {
             cwnd: value.cwnd,
+            bandwidth: value.bandwidth,
             reason,
         }
     }
@@ -166,6 +167,7 @@ impl AsSocketStats for QuicConnectionStats {
                 .as_ref()
                 .map(|p| p.delivery_rate)
                 .unwrap_or_default(),
+            max_bandwidth: self.path_stats.as_ref().and_then(|p| p.max_bandwidth),
             startup_exit: self
                 .path_stats
                 .as_ref()
@@ -194,7 +196,15 @@ pub struct Incoming {
     pub buf: PooledBuf,
     /// If set, then `buf` is a GRO buffer containing multiple packets.
     /// Each individual packet has a size of `gso` (except for the last one).
-    pub gro: Option<u16>,
+    pub gro: Option<i32>,
+    /// [SO_MARK] control message value received from the socket.
+    ///
+    /// This will always be `None` after the connection has been spawned as
+    /// the message is `take()`d before spawning.
+    ///
+    /// [SO_MARK]: https://man7.org/linux/man-pages/man7/socket.7.html
+    #[cfg(target_os = "linux")]
+    pub so_mark_data: Option<[u8; 4]>,
 }
 
 /// A QUIC connection that has not performed a handshake yet.
@@ -433,8 +443,9 @@ where
         let fut = async move {
             match handshake_fut.await {
                 Ok(running) => Self::resume(running),
-                Err(e) =>
-                    log::error!("QUIC handshake failed in IQC::start"; "error" => e),
+                Err(e) => {
+                    log::error!("QUIC handshake failed in IQC::start"; "error" => e)
+                },
             }
         };
 

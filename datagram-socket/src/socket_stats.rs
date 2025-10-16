@@ -30,6 +30,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -62,6 +64,7 @@ pub struct SocketStats {
     pub bytes_retrans: u64,
     pub bytes_unsent: u64,
     pub delivery_rate: u64,
+    pub max_bandwidth: Option<u64>,
     pub startup_exit: Option<StartupExit>,
     pub bytes_in_flight_duration_us: u64,
 }
@@ -70,6 +73,7 @@ pub struct SocketStats {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StartupExit {
     pub cwnd: usize,
+    pub bandwidth: Option<u64>,
     pub reason: StartupExitReason,
 }
 
@@ -108,6 +112,12 @@ pub struct QuicAuditStats {
     max_bandwidth: AtomicU64,
     /// Loss at max recorded bandwidth.
     max_loss_pct: AtomicU8,
+    /// The value of the first `SO_RECVMARK` control message received for the
+    /// connection.
+    ///
+    /// Linux-only.
+    #[cfg(target_os = "linux")]
+    initial_so_mark: OnceLock<[u8; 4]>,
     /// The server's chosen QUIC connection ID.
     ///
     /// The QUIC connection ID is presently an array of 20 bytes (160 bits)
@@ -127,6 +137,8 @@ impl QuicAuditStats {
             connection_close_reason: RwLock::new(None),
             max_bandwidth: AtomicU64::new(0),
             max_loss_pct: AtomicU8::new(0),
+            #[cfg(target_os = "linux")]
+            initial_so_mark: OnceLock::new(),
             quic_connection_id,
         }
     }
@@ -239,6 +251,20 @@ impl QuicAuditStats {
     #[inline]
     pub fn max_loss_pct(&self) -> u8 {
         self.max_loss_pct.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    #[cfg(target_os = "linux")]
+    pub fn set_initial_so_mark_data(&self, value: Option<[u8; 4]>) {
+        if let Some(inner) = value {
+            let _ = self.initial_so_mark.set(inner);
+        }
+    }
+
+    #[inline]
+    #[cfg(target_os = "linux")]
+    pub fn initial_so_mark_data(&self) -> Option<&[u8; 4]> {
+        self.initial_so_mark.get()
     }
 }
 

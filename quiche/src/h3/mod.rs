@@ -2964,16 +2964,6 @@ impl Connection {
             },
 
             frame::Frame::Headers { header_block } => {
-                if Some(stream_id) == self.peer_control_stream_id {
-                    conn.close(
-                        true,
-                        Error::FrameUnexpected.to_wire(),
-                        b"HEADERS received on control stream",
-                    )?;
-
-                    return Err(Error::FrameUnexpected);
-                }
-
                 // Servers reject too many HEADERS frames.
                 if let Some(s) = self.streams.get_mut(&stream_id) {
                     if self.is_server && s.headers_received_count() == 2 {
@@ -3048,30 +3038,10 @@ impl Connection {
             },
 
             frame::Frame::Data { .. } => {
-                if Some(stream_id) == self.peer_control_stream_id {
-                    conn.close(
-                        true,
-                        Error::FrameUnexpected.to_wire(),
-                        b"DATA received on control stream",
-                    )?;
-
-                    return Err(Error::FrameUnexpected);
-                }
-
                 // Do nothing. The Data event is returned separately.
             },
 
             frame::Frame::GoAway { id } => {
-                if Some(stream_id) != self.peer_control_stream_id {
-                    conn.close(
-                        true,
-                        Error::FrameUnexpected.to_wire(),
-                        b"GOAWAY received on non-control stream",
-                    )?;
-
-                    return Err(Error::FrameUnexpected);
-                }
-
                 if !self.is_server && id % 4 != 0 {
                     conn.close(
                         true,
@@ -3100,16 +3070,6 @@ impl Connection {
             },
 
             frame::Frame::MaxPushId { push_id } => {
-                if Some(stream_id) != self.peer_control_stream_id {
-                    conn.close(
-                        true,
-                        Error::FrameUnexpected.to_wire(),
-                        b"MAX_PUSH_ID received on non-control stream",
-                    )?;
-
-                    return Err(Error::FrameUnexpected);
-                }
-
                 if !self.is_server {
                     conn.close(
                         true,
@@ -3158,16 +3118,6 @@ impl Connection {
             },
 
             frame::Frame::CancelPush { .. } => {
-                if Some(stream_id) != self.peer_control_stream_id {
-                    conn.close(
-                        true,
-                        Error::FrameUnexpected.to_wire(),
-                        b"CANCEL_PUSH received on non-control stream",
-                    )?;
-
-                    return Err(Error::FrameUnexpected);
-                }
-
                 // TODO: implement CANCEL_PUSH frame
             },
 
@@ -3180,16 +3130,6 @@ impl Connection {
                         true,
                         Error::FrameUnexpected.to_wire(),
                         b"PRIORITY_UPDATE received by client",
-                    )?;
-
-                    return Err(Error::FrameUnexpected);
-                }
-
-                if Some(stream_id) != self.peer_control_stream_id {
-                    conn.close(
-                        true,
-                        Error::FrameUnexpected.to_wire(),
-                        b"PRIORITY_UPDATE received on non-control stream",
                     )?;
 
                     return Err(Error::FrameUnexpected);
@@ -3252,16 +3192,6 @@ impl Connection {
                         true,
                         Error::FrameUnexpected.to_wire(),
                         b"PRIORITY_UPDATE received by client",
-                    )?;
-
-                    return Err(Error::FrameUnexpected);
-                }
-
-                if Some(stream_id) != self.peer_control_stream_id {
-                    conn.close(
-                        true,
-                        Error::FrameUnexpected.to_wire(),
-                        b"PRIORITY_UPDATE received on non-control stream",
                     )?;
 
                     return Err(Error::FrameUnexpected);

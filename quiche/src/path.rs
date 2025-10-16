@@ -43,6 +43,7 @@ use crate::StartupExit;
 
 use crate::pmtud;
 use crate::recovery;
+use crate::recovery::Bandwidth;
 use crate::recovery::HandshakeStatus;
 use crate::recovery::OnLossDetectionTimeoutOutcome;
 use crate::recovery::RecoveryOps;
@@ -381,7 +382,6 @@ impl Path {
         };
 
         (hs_confirmed && hs_done) &&
-            pmtud.get_probe_size() > pmtud.get_current_mtu() &&
             self.recovery.cwnd_available() > pmtud.get_probe_size() &&
             out_len >= pmtud.get_probe_size() &&
             pmtud.should_probe() &&
@@ -527,6 +527,12 @@ impl Path {
     }
 
     pub fn stats(&self) -> PathStats {
+        let pmtu = match self.pmtud.as_ref().map(|p| p.get_current_mtu()) {
+            Some(v) => v,
+
+            None => self.recovery.max_datagram_size(),
+        };
+
         PathStats {
             local_addr: self.local_addr,
             peer_addr: self.peer_addr,
@@ -548,8 +554,12 @@ impl Path {
             recv_bytes: self.recv_bytes,
             lost_bytes: self.recovery.bytes_lost(),
             stream_retrans_bytes: self.stream_retrans_bytes,
-            pmtu: self.recovery.max_datagram_size(),
+            pmtu,
             delivery_rate: self.recovery.delivery_rate().to_bytes_per_second(),
+            max_bandwidth: self
+                .recovery
+                .max_bandwidth()
+                .map(Bandwidth::to_bytes_per_second),
             startup_exit: self.recovery.startup_exit(),
         }
     }
@@ -976,6 +986,12 @@ pub struct PathStats {
     /// [`SendInfo.at`]: struct.SendInfo.html#structfield.at
     /// [Pacing]: index.html#pacing
     pub delivery_rate: u64,
+
+    /// The maximum bandwidth estimate for the connection in bytes/s.
+    ///
+    /// Note: not all congestion control algorithms provide this metric;
+    /// it is currently only implemented for bbr2_gcongestion.
+    pub max_bandwidth: Option<u64>,
 
     /// Statistics from when a CCA first exited the startup phase.
     pub startup_exit: Option<StartupExit>,

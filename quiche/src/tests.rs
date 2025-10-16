@@ -7996,7 +7996,7 @@ fn connection_id_retire_exotic_sequence(
         frame::Frame::NewConnectionId {
             seq_num: 1,
             retire_prior_to: 0,
-            conn_id: vec![02],
+            conn_id: vec![2],
             reset_token: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
         },
         frame::Frame::NewConnectionId {
@@ -9623,6 +9623,9 @@ fn pmtud_probe_success(
     // Verify MTU was updated
     let current_mtu = pmtud.get_current_mtu();
     assert_eq!(current_mtu, 1400);
+
+    let path_stats = pipe.client.path_stats().next().unwrap();
+    assert_eq!(path_stats.pmtu, current_mtu);
 }
 
 #[rstest]
@@ -9777,6 +9780,9 @@ fn pmtud_probe_retry_after_loss(
     // second probe size=1300.
     assert_eq!(pmtud.get_probe_size(), 1250);
 
+    let path_stats = pipe.client.path_stats().next().unwrap();
+    assert_eq!(path_stats.pmtu, 1200);
+
     // Make probes succeed til pmtu is found
     assert_eq!(pipe.advance(), Ok(()));
 
@@ -9790,10 +9796,14 @@ fn pmtud_probe_retry_after_loss(
         .unwrap();
 
     // MTU should finally update
-    assert_eq!(pmtud.get_current_mtu(), 1299);
+    let current_mtu = pmtud.get_current_mtu();
+    assert_eq!(current_mtu, 1299);
 
     // Verify should_probe gets reset
     assert!(!pmtud.should_probe());
+
+    let path_stats = pipe.client.path_stats().next().unwrap();
+    assert_eq!(path_stats.pmtu, current_mtu);
 }
 
 #[cfg(feature = "boringssl-boring-crate")]
@@ -9870,17 +9880,19 @@ fn enable_pmtud_mid_handshake(
 
     assert_eq!(pipe.advance(), Ok(()));
 
-    assert_eq!(
-        pipe.server
-            .paths
-            .get_active_mut()
-            .unwrap()
-            .pmtud
-            .as_mut()
-            .unwrap()
-            .get_current_mtu(),
-        1350
-    );
+    let current_mtu = pipe
+        .server
+        .paths
+        .get_active_mut()
+        .unwrap()
+        .pmtud
+        .as_mut()
+        .unwrap()
+        .get_current_mtu();
+    assert_eq!(current_mtu, 1350);
+
+    let path_stats = pipe.server.path_stats().next().unwrap();
+    assert_eq!(path_stats.pmtu, current_mtu);
 }
 
 #[cfg(feature = "boringssl-boring-crate")]
@@ -9959,4 +9971,78 @@ fn disable_pmtud_mid_handshake(
 
     let active_path = pipe.server.paths.get_active_mut().unwrap();
     assert!(active_path.pmtud.is_none());
+}
+
+#[rstest]
+fn configuration_values_are_limited_to_max_varint() {
+    let mut config = Config::new(0x1).unwrap();
+    config
+        .set_application_protos(&[b"proto1", b"proto2"])
+        .unwrap();
+    let v = octets::MAX_VAR_INT + 1;
+    let uv = v as usize;
+    config.set_max_idle_timeout(v);
+    config.set_max_recv_udp_payload_size(uv);
+    config.set_initial_max_data(v);
+    config.set_initial_max_stream_data_bidi_local(v);
+    config.set_initial_max_stream_data_bidi_remote(v);
+    config.set_initial_max_stream_data_uni(v);
+    config.set_initial_max_streams_bidi(v);
+    config.set_initial_max_streams_uni(v);
+    config.set_ack_delay_exponent(v);
+    config.set_max_ack_delay(v);
+    config.set_active_connection_id_limit(v);
+    config.verify_peer(false);
+
+    let mut pipe = test_utils::Pipe::with_client_config(&mut config).unwrap();
+    assert_eq!(
+        pipe.client.local_transport_params.max_idle_timeout,
+        octets::MAX_VAR_INT
+    );
+    assert_eq!(
+        pipe.client.local_transport_params.max_udp_payload_size,
+        cmp::min(octets::MAX_VAR_INT, uv as u64)
+    );
+    assert_eq!(
+        pipe.client.local_transport_params.initial_max_data,
+        octets::MAX_VAR_INT
+    );
+    assert_eq!(
+        pipe.client
+            .local_transport_params
+            .initial_max_stream_data_bidi_local,
+        octets::MAX_VAR_INT
+    );
+    assert_eq!(
+        pipe.client
+            .local_transport_params
+            .initial_max_stream_data_bidi_remote,
+        octets::MAX_VAR_INT
+    );
+    assert_eq!(
+        pipe.client
+            .local_transport_params
+            .initial_max_stream_data_uni,
+        octets::MAX_VAR_INT
+    );
+    assert_eq!(
+        pipe.client.local_transport_params.initial_max_streams_bidi,
+        octets::MAX_VAR_INT
+    );
+    assert_eq!(
+        pipe.client.local_transport_params.initial_max_streams_uni,
+        octets::MAX_VAR_INT
+    );
+    assert_eq!(
+        pipe.client.local_transport_params.ack_delay_exponent,
+        octets::MAX_VAR_INT
+    );
+    assert_eq!(
+        pipe.client.local_transport_params.active_conn_id_limit,
+        octets::MAX_VAR_INT
+    );
+
+    // It's fine that this will fail with an error. We just want to ensure we
+    // do not panic because of too large values that we try to encode via varint.
+    assert_eq!(pipe.handshake(), Err(Error::InvalidTransportParam));
 }

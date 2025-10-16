@@ -40,6 +40,7 @@ use std::time::Duration;
 use tokio::select;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::time::sleep;
 use tokio::time::sleep_until;
 use tokio::time::Instant;
 use tokio_quiche::buf_factory::BufFactory;
@@ -343,9 +344,9 @@ impl ApplicationOverQuic for H3iDriver {
         }
 
         // Re-create the iterator so we can mutably borrow the stream parser map
-        let mut iter =
-            self.actions.clone().into_iter().skip(self.actions_executed);
-        while let Some(action) = iter.next() {
+        let iter = self.actions.clone().into_iter().skip(self.actions_executed);
+
+        for action in iter {
             match action {
                 Action::SendFrame { .. } |
                 Action::StreamBytes { .. } |
@@ -387,7 +388,14 @@ impl ApplicationOverQuic for H3iDriver {
     ) -> QuicResult<()> {
         log::trace!("h3i: wait_for_data");
 
-        let waiting = !self.should_fire();
+        let sleep_fut = if !self.should_fire() {
+            sleep_until(self.next_fire_time)
+        } else {
+            // If we have nothing to send, allow the IOW to resolve wait_for_data
+            // on its own (whether via Quiche timer or incoming data).
+            sleep(Duration::MAX)
+        };
+
         select! {
             rx = &mut self.close_trigger_seen_rx, if !self.close_trigger_seen_rx.is_terminated() => {
                 // NOTE: wait_for_data can be called again after all close triggers have been seen,
@@ -398,9 +406,7 @@ impl ApplicationOverQuic for H3iDriver {
                     let _ = qconn.close(true, quiche::h3::WireErrorCode::NoError as u64, b"saw all expected frames");
                 }
             }
-            _ = sleep_until(self.next_fire_time), if waiting => {
-                log::debug!("h3i: releasing wait timer");
-            }
+            _ = sleep_fut => {}
         }
 
         Ok(())
@@ -416,7 +422,7 @@ impl ApplicationOverQuic for H3iDriver {
     ) {
         let _ = self
             .record_tx
-            .send(ConnectionRecord::Close(ConnectionCloseDetails::new(&qconn)));
+            .send(ConnectionRecord::Close(ConnectionCloseDetails::new(qconn)));
 
         let _ = self
             .record_tx

@@ -356,6 +356,12 @@ impl Stream {
                         (frame::MAX_PUSH_FRAME_TYPE_ID, _) =>
                             return Err(Error::FrameUnexpected),
 
+                        (frame::PRIORITY_UPDATE_FRAME_REQUEST_TYPE_ID, _) =>
+                            return Err(Error::FrameUnexpected),
+
+                        (frame::PRIORITY_UPDATE_FRAME_PUSH_TYPE_ID, _) =>
+                            return Err(Error::FrameUnexpected),
+
                         (frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID, _) => {
                             self.ty = Some(Type::WebTransport);
                             self.frame_type = Some(frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID);
