@@ -188,9 +188,9 @@ pub trait RecoveryOps {
     /// otherwise have constructed an ACK eliciting packet.
     fn should_elicit_ack(&self, epoch: packet::Epoch) -> bool;
 
-    fn get_acked_frames(&mut self, epoch: packet::Epoch) -> Vec<frame::Frame>;
+    fn next_acked_frame(&mut self, epoch: packet::Epoch) -> Option<frame::Frame>;
 
-    fn get_lost_frames(&mut self, epoch: packet::Epoch) -> Vec<frame::Frame>;
+    fn next_lost_frame(&mut self, epoch: packet::Epoch) -> Option<frame::Frame>;
 
     fn get_largest_acked_on_epoch(&self, epoch: packet::Epoch) -> Option<u64>;
     fn has_lost_frames(&self, epoch: packet::Epoch) -> bool;
@@ -265,7 +265,6 @@ pub trait RecoveryOps {
     #[cfg(test)]
     fn sent_packets_len(&self, epoch: packet::Epoch) -> usize;
 
-    #[cfg(test)]
     fn bytes_in_flight(&self) -> usize;
 
     fn bytes_in_flight_duration(&self) -> Duration;
@@ -366,10 +365,6 @@ pub enum CongestionControlAlgorithm {
     Reno            = 0,
     /// CUBIC congestion control algorithm (default). `cubic` in a string form.
     CUBIC           = 1,
-    /// BBR congestion control algorithm. `bbr` in a string form.
-    BBR             = 2,
-    /// BBRv2 congestion control algorithm. `bbr2` in a string form.
-    BBR2            = 3,
     /// BBRv2 congestion control algorithm implementation from gcongestion
     /// branch. `bbr2_gcongestion` in a string form.
     Bbr2Gcongestion = 4,
@@ -385,10 +380,7 @@ impl FromStr for CongestionControlAlgorithm {
         match name {
             "reno" => Ok(CongestionControlAlgorithm::Reno),
             "cubic" => Ok(CongestionControlAlgorithm::CUBIC),
-            "bbr" => Ok(CongestionControlAlgorithm::BBR),
-            #[cfg(not(feature = "gcongestion"))]
-            "bbr2" => Ok(CongestionControlAlgorithm::BBR2),
-            #[cfg(feature = "gcongestion")]
+            "bbr" => Ok(CongestionControlAlgorithm::Bbr2Gcongestion),
             "bbr2" => Ok(CongestionControlAlgorithm::Bbr2Gcongestion),
             "bbr2_gcongestion" => Ok(CongestionControlAlgorithm::Bbr2Gcongestion),
             _ => Err(crate::Error::CongestionControl),
@@ -600,7 +592,6 @@ pub struct ReleaseDecision {
 
 impl ReleaseTime {
     /// Add the specific delay to the current time
-    #[allow(dead_code)]
     fn inc(&mut self, delay: Duration) {
         match self {
             ReleaseTime::Immediate => {},
@@ -609,7 +600,6 @@ impl ReleaseTime {
     }
 
     /// Set the time to the later of two times
-    #[allow(dead_code)]
     fn set_max(&mut self, other: Instant) {
         match self {
             ReleaseTime::Immediate => *self = ReleaseTime::At(other),
@@ -623,7 +613,6 @@ impl ReleaseDecision {
 
     /// Get the [`Instant`] the next packet should be released. It will never be
     /// in the past.
-    #[allow(dead_code)]
     #[inline]
     pub fn time(&self, now: Instant) -> Option<Instant> {
         match self.time {
@@ -633,14 +622,12 @@ impl ReleaseDecision {
     }
 
     /// Can this packet be appended to a previous burst
-    #[allow(dead_code)]
     #[inline]
     pub fn can_burst(&self) -> bool {
         self.allow_burst
     }
 
     /// Check if the two packets can be released at the same time
-    #[allow(dead_code)]
     #[inline]
     pub fn time_eq(&self, other: &Self, now: Instant) -> bool {
         let delta = match (self.time(now), other.time(now)) {
@@ -712,7 +699,6 @@ pub enum StartupExitReason {
 mod tests {
     use super::*;
     use crate::packet;
-    use crate::recovery::congestion::PACING_MULTIPLIER;
     use crate::test_utils;
     use crate::CongestionControlAlgorithm;
     use crate::DEFAULT_INITIAL_RTT;
@@ -737,20 +723,12 @@ mod tests {
         assert!(!recovery_for_alg(algo).gcongestion_enabled());
 
         let algo = CongestionControlAlgorithm::from_str("bbr").unwrap();
-        assert_eq!(algo, CongestionControlAlgorithm::BBR);
-        assert!(!recovery_for_alg(algo).gcongestion_enabled());
+        assert_eq!(algo, CongestionControlAlgorithm::Bbr2Gcongestion);
+        assert!(recovery_for_alg(algo).gcongestion_enabled());
 
         let algo = CongestionControlAlgorithm::from_str("bbr2").unwrap();
-        #[cfg(not(feature = "gcongestion"))]
-        {
-            assert_eq!(algo, CongestionControlAlgorithm::BBR2);
-            assert!(!recovery_for_alg(algo).gcongestion_enabled());
-        }
-        #[cfg(feature = "gcongestion")]
-        {
-            assert_eq!(algo, CongestionControlAlgorithm::Bbr2Gcongestion);
-            assert!(recovery_for_alg(algo).gcongestion_enabled());
-        }
+        assert_eq!(algo, CongestionControlAlgorithm::Bbr2Gcongestion);
+        assert!(recovery_for_alg(algo).gcongestion_enabled());
 
         let algo =
             CongestionControlAlgorithm::from_str("bbr2_gcongestion").unwrap();
@@ -768,7 +746,7 @@ mod tests {
 
     #[rstest]
     fn loss_on_pto(
-        #[values("reno", "cubic", "bbr", "bbr2", "bbr2_gcongestion")]
+        #[values("reno", "cubic", "bbr2", "bbr2_gcongestion")]
         cc_algorithm_name: &str,
     ) {
         let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
@@ -1055,7 +1033,7 @@ mod tests {
 
     #[rstest]
     fn loss_on_timer(
-        #[values("reno", "cubic", "bbr", "bbr2", "bbr2_gcongestion")]
+        #[values("reno", "cubic", "bbr2", "bbr2_gcongestion")]
         cc_algorithm_name: &str,
     ) {
         let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
@@ -1252,7 +1230,7 @@ mod tests {
 
     #[rstest]
     fn loss_on_reordering(
-        #[values("reno", "cubic", "bbr", "bbr2", "bbr2_gcongestion")]
+        #[values("reno", "cubic", "bbr2", "bbr2_gcongestion")]
         cc_algorithm_name: &str,
     ) {
         let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
@@ -1739,11 +1717,21 @@ mod tests {
 
     #[rstest]
     fn pacing(
-        #[values("reno", "cubic", "bbr", "bbr2", "bbr2_gcongestion")]
+        #[values("reno", "cubic", "bbr2", "bbr2_gcongestion")]
         cc_algorithm_name: &str,
+        #[values(false, true)] time_sent_set_to_now: bool,
     ) {
+        let pacing_enabled = cc_algorithm_name == "bbr2" ||
+            cc_algorithm_name == "bbr2_gcongestion";
+
         let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
         assert_eq!(cfg.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
+
+        #[cfg(feature = "internal")]
+        cfg.set_custom_bbr_params(BbrParams {
+            time_sent_set_to_now: Some(time_sent_set_to_now),
+            ..Default::default()
+        });
 
         let mut r = Recovery::new(&cfg);
 
@@ -1785,8 +1773,7 @@ mod tests {
         assert_eq!(r.bytes_in_flight(), 12000);
         assert_eq!(r.bytes_in_flight_duration(), Duration::ZERO);
 
-        // Next packet will be sent out immediately.
-        if cc_algorithm_name != "bbr2_gcongestion" {
+        if !pacing_enabled {
             assert_eq!(r.pacing_rate(), 0);
         } else {
             assert_eq!(r.pacing_rate(), 103963);
@@ -1797,7 +1784,8 @@ mod tests {
         assert_eq!(r.cwnd_available(), 0);
 
         // Wait 50ms for ACK.
-        now += Duration::from_millis(50);
+        let initial_rtt = Duration::from_millis(50);
+        now += initial_rtt;
 
         let mut acked = RangeSet::default();
         acked.insert(0..10);
@@ -1823,8 +1811,9 @@ mod tests {
 
         assert_eq!(r.sent_packets_len(packet::Epoch::Application), 0);
         assert_eq!(r.bytes_in_flight(), 0);
-        assert_eq!(r.bytes_in_flight_duration(), Duration::from_millis(50));
-        assert_eq!(r.rtt(), Duration::from_millis(50));
+        assert_eq!(r.bytes_in_flight_duration(), initial_rtt);
+        assert_eq!(r.min_rtt(), Some(initial_rtt));
+        assert_eq!(r.rtt(), initial_rtt);
 
         // 10 MSS increased due to acks.
         assert_eq!(r.cwnd(), 12000 + 1200 * 10);
@@ -1859,17 +1848,17 @@ mod tests {
 
         assert_eq!(r.sent_packets_len(packet::Epoch::Application), 1);
         assert_eq!(r.bytes_in_flight(), 6000);
-        assert_eq!(r.bytes_in_flight_duration(), Duration::from_millis(50));
+        assert_eq!(r.bytes_in_flight_duration(), initial_rtt);
 
-        if cc_algorithm_name != "bbr2_gcongestion" {
-            // Pacing is not done during initial phase of connection.
+        if !pacing_enabled {
+            // Pacing is disabled.
             assert_eq!(r.get_packet_send_time(now), now);
         } else {
             // Pacing is done from the beginning.
             assert_ne!(r.get_packet_send_time(now), now);
         }
 
-        // Send the third packet burst.
+        // Send the third and fourth packet bursts together.
         let p = Sent {
             pkt_num: 11,
             frames: smallvec![],
@@ -1899,7 +1888,7 @@ mod tests {
 
         assert_eq!(r.sent_packets_len(packet::Epoch::Application), 2);
         assert_eq!(r.bytes_in_flight(), 12000);
-        assert_eq!(r.bytes_in_flight_duration(), Duration::from_millis(50));
+        assert_eq!(r.bytes_in_flight_duration(), initial_rtt);
 
         // Send the fourth packet burst.
         let p = Sent {
@@ -1931,52 +1920,22 @@ mod tests {
 
         assert_eq!(r.sent_packets_len(packet::Epoch::Application), 3);
         assert_eq!(r.bytes_in_flight(), 13000);
-        assert_eq!(r.bytes_in_flight_duration(), Duration::from_millis(50));
+        assert_eq!(r.bytes_in_flight_duration(), initial_rtt);
 
         // We pace this outgoing packet. as all conditions for pacing
         // are passed.
-        let pacing_rate = match cc_algorithm_name {
-            "bbr" => {
-                // Constants from congestion/bbr/mod.rs
-                let cwnd_gain = 2.0;
-                let startup_pacing_gain = 2.89;
-                // Adjust for cwnd_gain.  BW estimate was made before the CWND
-                // increase.
-                let bw = r.cwnd() as f64 /
-                    cwnd_gain /
-                    Duration::from_millis(50).as_secs_f64();
-                (bw * startup_pacing_gain) as u64
-            },
-            "bbr2_gcongestion" => {
-                let cwnd_gain: f64 = 2.0;
-                // Adjust for cwnd_gain.  BW estimate was made before the CWND
-                // increase.
-                let bw = r.cwnd() as f64 /
-                    cwnd_gain /
-                    Duration::from_millis(50).as_secs_f64();
-                bw as u64
-            },
-            "bbr2" => {
-                // Constants from congestion/bbr2/mod.rs
-                let cwnd_gain = 2.0;
-                let startup_pacing_gain = 2.77;
-                let pacing_margin_percent = 0.01;
-                // Adjust for cwnd_gain.  BW estimate was made before the CWND
-                // increase.
-                let bw = r.cwnd() as f64 /
-                    cwnd_gain /
-                    Duration::from_millis(50).as_secs_f64();
-                (bw * startup_pacing_gain * (1.0 - pacing_margin_percent)) as u64
-            },
-            _ => {
-                let bw =
-                    r.cwnd() as f64 / Duration::from_millis(50).as_secs_f64();
-                (bw * PACING_MULTIPLIER) as u64
-            },
+        let pacing_rate = if pacing_enabled {
+            let cwnd_gain: f64 = 2.0;
+            // Adjust for cwnd_gain.  BW estimate was made before the CWND
+            // increase.
+            let bw = r.cwnd() as f64 / cwnd_gain / initial_rtt.as_secs_f64();
+            bw as u64
+        } else {
+            0
         };
         assert_eq!(r.pacing_rate(), pacing_rate);
 
-        let scale_factor = if cc_algorithm_name == "bbr2_gcongestion" {
+        let scale_factor = if pacing_enabled {
             // For bbr2_gcongestion, send time is almost 13000 / pacing_rate.
             // Don't know where 13000 comes from.
             1.08333332
@@ -1985,9 +1944,129 @@ mod tests {
         };
         assert_eq!(
             r.get_packet_send_time(now) - now,
-            Duration::from_secs_f64(scale_factor * 12000.0 / pacing_rate as f64)
+            if pacing_enabled {
+                Duration::from_secs_f64(
+                    scale_factor * 12000.0 / pacing_rate as f64,
+                )
+            } else {
+                Duration::ZERO
+            }
         );
         assert_eq!(r.startup_exit(), None);
+
+        let reduced_rtt = Duration::from_millis(40);
+        now += reduced_rtt;
+
+        let mut acked = RangeSet::default();
+        acked.insert(10..11);
+
+        assert_eq!(
+            r.on_ack_received(
+                &acked,
+                0,
+                packet::Epoch::Application,
+                HandshakeStatus::default(),
+                now,
+                None,
+                "",
+            )
+            .unwrap(),
+            OnAckReceivedOutcome {
+                lost_packets: 0,
+                lost_bytes: 0,
+                acked_bytes: 6000,
+                spurious_losses: 0,
+            }
+        );
+
+        let expected_srtt = (7 * initial_rtt + reduced_rtt) / 8;
+        assert_eq!(r.sent_packets_len(packet::Epoch::Application), 2);
+        assert_eq!(r.bytes_in_flight(), 7000);
+        assert_eq!(r.bytes_in_flight_duration(), initial_rtt + reduced_rtt);
+        assert_eq!(r.min_rtt(), Some(reduced_rtt));
+        assert_eq!(r.rtt(), expected_srtt);
+
+        let mut acked = RangeSet::default();
+        acked.insert(11..12);
+
+        assert_eq!(
+            r.on_ack_received(
+                &acked,
+                0,
+                packet::Epoch::Application,
+                HandshakeStatus::default(),
+                now,
+                None,
+                "",
+            )
+            .unwrap(),
+            OnAckReceivedOutcome {
+                lost_packets: 0,
+                lost_bytes: 0,
+                acked_bytes: 6000,
+                spurious_losses: 0,
+            }
+        );
+
+        // When enabled, the pacer adds a 25msec delay to the packet
+        // sends which will be applied to the sent times tracked by
+        // the recovery module, bringing down RTT to 15msec.
+        let expected_min_rtt = if pacing_enabled &&
+            !time_sent_set_to_now &&
+            cfg!(feature = "internal")
+        {
+            reduced_rtt - Duration::from_millis(25)
+        } else {
+            reduced_rtt
+        };
+
+        assert_eq!(r.sent_packets_len(packet::Epoch::Application), 1);
+        assert_eq!(r.bytes_in_flight(), 1000);
+        assert_eq!(r.bytes_in_flight_duration(), initial_rtt + reduced_rtt);
+        assert_eq!(r.min_rtt(), Some(expected_min_rtt));
+
+        let expected_srtt = (7 * expected_srtt + expected_min_rtt) / 8;
+        assert_eq!(r.rtt(), expected_srtt);
+
+        let mut acked = RangeSet::default();
+        acked.insert(12..13);
+
+        assert_eq!(
+            r.on_ack_received(
+                &acked,
+                0,
+                packet::Epoch::Application,
+                HandshakeStatus::default(),
+                now,
+                None,
+                "",
+            )
+            .unwrap(),
+            OnAckReceivedOutcome {
+                lost_packets: 0,
+                lost_bytes: 0,
+                acked_bytes: 1000,
+                spurious_losses: 0,
+            }
+        );
+
+        // Pacer adds 50msec delay to the second packet, resulting in
+        // an effective RTT of 0.
+        let expected_min_rtt = if pacing_enabled &&
+            !time_sent_set_to_now &&
+            cfg!(feature = "internal")
+        {
+            Duration::from_millis(0)
+        } else {
+            reduced_rtt
+        };
+        assert_eq!(r.sent_packets_len(packet::Epoch::Application), 0);
+        assert_eq!(r.bytes_in_flight(), 0);
+        assert_eq!(r.bytes_in_flight_duration(), initial_rtt + reduced_rtt);
+        assert_eq!(r.min_rtt(), Some(expected_min_rtt));
+
+        let expected_srtt = (7 * expected_srtt + expected_min_rtt) / 8;
+        assert_eq!(r.rtt(), expected_srtt);
     }
 
     #[rstest]
@@ -2178,7 +2257,7 @@ mod tests {
 
     #[rstest]
     fn pmtud_loss_on_timer(
-        #[values("reno", "cubic", "bbr", "bbr2", "bbr2_gcongestion")]
+        #[values("reno", "cubic", "bbr2", "bbr2_gcongestion")]
         cc_algorithm_name: &str,
     ) {
         let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
@@ -2325,11 +2404,7 @@ mod tests {
         assert_eq!(r.in_flight_count(packet::Epoch::Application), 0);
         assert_eq!(r.bytes_in_flight(), 0);
         assert_eq!(r.bytes_in_flight_duration(), Duration::from_micros(11250));
-        assert_eq!(r.cwnd(), match cc_algorithm_name {
-            "bbr" => 14000,
-            "bbr2" => 14000,
-            _ => 12000,
-        });
+        assert_eq!(r.cwnd(), 12000);
 
         assert_eq!(r.lost_count(), 0);
 
@@ -2353,7 +2428,7 @@ mod tests {
     // congestion specific algorithms.
     #[rstest]
     fn congestion_delivery_rate(
-        #[values("reno", "cubic", "bbr", "bbr2")] cc_algorithm_name: &str,
+        #[values("reno", "cubic", "bbr2")] cc_algorithm_name: &str,
     ) {
         let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
         assert_eq!(cfg.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
@@ -2409,6 +2484,156 @@ mod tests {
             r.delivery_rate().to_bytes_per_second()
         );
         assert_eq!(r.startup_exit(), None);
+    }
+
+    #[rstest]
+    fn acks_with_no_retransmittable_data(
+        #[values("reno", "cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+    ) {
+        let rtt = Duration::from_millis(100);
+
+        let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        assert_eq!(cfg.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
+
+        let mut r = Recovery::new(&cfg);
+
+        let mut now = Instant::now();
+
+        assert_eq!(r.sent_packets_len(packet::Epoch::Application), 0);
+
+        let mut next_packet = 0;
+        // send some packets.
+        for _ in 0..3 {
+            let p = test_utils::helper_packet_sent(next_packet, now, 1200);
+            next_packet += 1;
+            r.on_packet_sent(
+                p,
+                packet::Epoch::Application,
+                HandshakeStatus::default(),
+                now,
+                "",
+            );
+        }
+
+        assert_eq!(r.sent_packets_len(packet::Epoch::Application), 3);
+        assert_eq!(r.bytes_in_flight(), 3600);
+        assert_eq!(r.bytes_in_flight_duration(), Duration::ZERO);
+
+        assert_eq!(
+            r.pacing_rate(),
+            if cc_algorithm_name == "bbr2_gcongestion" {
+                103963
+            } else {
+                0
+            },
+        );
+        assert_eq!(r.get_packet_send_time(now), now);
+        assert_eq!(r.cwnd(), 12000);
+        assert_eq!(r.cwnd_available(), 8400);
+
+        // Wait 1 rtt for ACK.
+        now += rtt;
+
+        let mut acked = RangeSet::default();
+        acked.insert(0..3);
+
+        assert_eq!(
+            r.on_ack_received(
+                &acked,
+                10,
+                packet::Epoch::Application,
+                HandshakeStatus::default(),
+                now,
+                None,
+                "",
+            )
+            .unwrap(),
+            OnAckReceivedOutcome {
+                lost_packets: 0,
+                lost_bytes: 0,
+                acked_bytes: 3600,
+                spurious_losses: 0,
+            }
+        );
+
+        assert_eq!(r.sent_packets_len(packet::Epoch::Application), 0);
+        assert_eq!(r.bytes_in_flight(), 0);
+        assert_eq!(r.bytes_in_flight_duration(), rtt);
+        assert_eq!(r.rtt(), rtt);
+
+        // Pacing rate is recalculated based on initial cwnd when the
+        // first RTT estimate is available.
+        assert_eq!(
+            r.pacing_rate(),
+            if cc_algorithm_name == "bbr2_gcongestion" {
+                120000
+            } else {
+                0
+            },
+        );
+
+        // Send some no "in_flight" packets
+        for iter in 3..1000 {
+            let mut p = test_utils::helper_packet_sent(next_packet, now, 1200);
+            // `in_flight = false` marks packets as if they only contained ACK
+            // frames.
+            p.in_flight = false;
+            next_packet += 1;
+            r.on_packet_sent(
+                p,
+                packet::Epoch::Application,
+                HandshakeStatus::default(),
+                now,
+                "",
+            );
+
+            now += rtt;
+
+            let mut acked = RangeSet::default();
+            acked.insert(iter..(iter + 1));
+
+            assert_eq!(
+                r.on_ack_received(
+                    &acked,
+                    10,
+                    packet::Epoch::Application,
+                    HandshakeStatus::default(),
+                    now,
+                    None,
+                    "",
+                )
+                .unwrap(),
+                OnAckReceivedOutcome {
+                    lost_packets: 0,
+                    lost_bytes: 0,
+                    acked_bytes: 0,
+                    spurious_losses: 0,
+                }
+            );
+
+            // Verify that connection has not exited startup.
+            assert_eq!(r.startup_exit(), None, "{iter}");
+
+            // Unchanged metrics.
+            assert_eq!(
+                r.sent_packets_len(packet::Epoch::Application),
+                0,
+                "{iter}"
+            );
+            assert_eq!(r.bytes_in_flight(), 0, "{iter}");
+            assert_eq!(r.bytes_in_flight_duration(), rtt, "{iter}");
+            assert_eq!(
+                r.pacing_rate(),
+                if cc_algorithm_name == "bbr2_gcongestion" ||
+                    cc_algorithm_name == "bbr2"
+                {
+                    120000
+                } else {
+                    0
+                },
+                "{iter}"
+            );
+        }
     }
 }
 

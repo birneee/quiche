@@ -1,16 +1,15 @@
 [package]
 name = "quiche"
-version = "0.24.6"
-authors = ["Alessandro Ghedini <alessandro@ghedini.me>"]
+version = "0.24.9"
 description = "🥧 Savoury implementation of the QUIC transport protocol and HTTP/3"
-build = "src/build.rs"
-rust-version = "1.83"
-edition = { workspace = true }
 repository = { workspace = true }
+authors = ["Alessandro Ghedini <alessandro@ghedini.me>"]
+edition = { workspace = true }
 license = { workspace = true }
-readme = { workspace = true }
 keywords = { workspace = true }
 categories = { workspace = true }
+readme = { workspace = true }
+build = "src/build.rs"
 include = [
   "/*.md",
   "/*.toml",
@@ -26,6 +25,7 @@ include = [
   "/quiche.svg",
   "/src",
 ]
+rust-version = "1.85"
 
 [features]
 default = ["boringssl-vendored"]
@@ -70,7 +70,6 @@ cdylib-link-lines = { version = "0.1", optional = true }
 
 [dependencies]
 boring = { workspace = true, optional = true }
-debug_panic = { version = "0.2.1" }
 either = { version = "1.8", default-features = false }
 foreign-types-shared = { version = "0.3.0", optional = true }
 intrusive-collections = "0.9.5"

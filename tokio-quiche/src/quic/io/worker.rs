@@ -213,7 +213,13 @@ where
                         return Ok(());
                     }
 
+                    let mut flush_operation_token =
+                        TrackMidHandshakeFlush::new(self.metrics.clone());
+
                     self.flush_buffer_to_socket(ctx.buffer()).await;
+
+                    flush_operation_token.mark_complete();
+
                     packets_sent += self.write_state.num_pkts;
 
                     if let ControlFlow::Break(reason) =
@@ -583,6 +589,7 @@ where
                     self.write_state.tx_time,
                     self.metrics
                         .write_errors(labels::QuicWriteError::WouldBlock),
+                    self.metrics.send_to_wouldblock_duration_s(),
                 )
                 .await
             } else {
@@ -634,8 +641,18 @@ where
         &mut self, qconn: &mut QuicheConnection, quic_application: &mut A,
     ) -> QuicResult<()> {
         if quic_application.should_act() {
+            // Poll the application to make progress.
+            //
+            // Once the connection has been established (i.e. the handshake is
+            // complete), we only poll the application.
+            //
+            // The exception is 0-RTT in TLS 1.3, where the full handshake is
+            // still in progress but we have 0-RTT keys to process early data.
+            // This means TLS callbacks might only be polled on the next timeout
+            // or when a packet is received from the peer.
             quic_application.wait_for_data(qconn).await
         } else {
+            // Poll quiche to make progress on handshake callbacks.
             self.wait_for_quiche(qconn, quic_application).await
         }
     }
@@ -718,8 +735,8 @@ where
         A: ApplicationOverQuic,
     {
         // This makes an assumption that the waker being set in ex_data is stable
-        // accross the active task's lifetime. Moving a future that encompasses an
-        // async callback from this task accross a channel, for example, will
+        // across the active task's lifetime. Moving a future that encompasses an
+        // async callback from this task across a channel, for example, will
         // cause issues as this waker will then be stale and attempt to
         // wake the wrong task.
         std::future::poll_fn(|cx| {
@@ -932,5 +949,33 @@ fn min_of_some<T: Ord>(v1: Option<T>, v2: Option<T>) -> Option<T> {
         (Some(a), Some(b)) => Some(a.min(b)),
         (Some(v), _) | (_, Some(v)) => Some(v),
         (None, None) => None,
+    }
+}
+
+/// A Token which increment the skipped_mid_handshake_flush_count metric on
+/// `Drop` unless it is marked complete.
+struct TrackMidHandshakeFlush<M: Metrics> {
+    complete: bool,
+    metrics: M,
+}
+
+impl<M: Metrics> TrackMidHandshakeFlush<M> {
+    fn new(metrics: M) -> Self {
+        Self {
+            complete: false,
+            metrics,
+        }
+    }
+
+    fn mark_complete(&mut self) {
+        self.complete = true;
+    }
+}
+
+impl<M: Metrics> Drop for TrackMidHandshakeFlush<M> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.metrics.skipped_mid_handshake_flush_count().inc();
+        }
     }
 }

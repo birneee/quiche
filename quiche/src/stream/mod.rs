@@ -61,6 +61,35 @@ pub struct StreamIdHasher {
     id: u64,
 }
 
+/// Return value type of `RecvBuf::reset()`
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub struct RecvBufResetReturn {
+    /// Returns the difference between the previous max_data offset
+    /// received and the final size reported by the reset
+    pub max_data_delta: u64,
+
+    /// The amount of flow control credit that should be returned to the
+    /// connection level flow control.
+    pub consumed_flowcontrol: u64,
+}
+
+impl RecvBufResetReturn {
+    pub fn zero() -> Self {
+        Self {
+            max_data_delta: 0,
+            consumed_flowcontrol: 0,
+        }
+    }
+}
+
+/// Action to perform when reading from a stream's receive buffer.
+pub enum RecvAction<'a> {
+    /// Emit data by copying it into the provided buffer.
+    Emit { out: &'a mut [u8] },
+    /// Discard up to the specified number of bytes without copying.
+    Discard { len: usize },
+}
+
 impl std::hash::Hasher for StreamIdHasher {
     #[inline]
     fn finish(&self) -> u64 {
@@ -795,44 +824,41 @@ impl PartialEq for StreamPriorityKey {
 impl Eq for StreamPriorityKey {}
 
 impl PartialOrd for StreamPriorityKey {
-    // Priority ordering is complex, disable Clippy warning.
-    #[allow(clippy::non_canonical_partial_ord_impl)]
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        // Ignore priority if ID matches.
-        if self.id == other.id {
-            return Some(cmp::Ordering::Equal);
-        }
-
-        // First, order by urgency...
-        if self.urgency != other.urgency {
-            return self.urgency.partial_cmp(&other.urgency);
-        }
-
-        // ...when the urgency is the same, and both are not incremental, order
-        // by stream ID...
-        if !self.incremental && !other.incremental {
-            return self.id.partial_cmp(&other.id);
-        }
-
-        // ...non-incremental takes priority over incremental...
-        if self.incremental && !other.incremental {
-            return Some(cmp::Ordering::Greater);
-        }
-        if !self.incremental && other.incremental {
-            return Some(cmp::Ordering::Less);
-        }
-
-        // ...finally, when both are incremental, `other` takes precedence (so
-        // `self` is always sorted after other same-urgency incremental
-        // entries).
-        Some(cmp::Ordering::Greater)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for StreamPriorityKey {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
-        // `partial_cmp()` never returns `None`, so this should be safe.
-        self.partial_cmp(other).unwrap()
+        // Ignore priority if ID matches.
+        if self.id == other.id {
+            return cmp::Ordering::Equal;
+        }
+
+        // First, order by urgency...
+        if self.urgency != other.urgency {
+            return self.urgency.cmp(&other.urgency);
+        }
+
+        // ...when the urgency is the same, and both are not incremental, order
+        // by stream ID...
+        if !self.incremental && !other.incremental {
+            return self.id.cmp(&other.id);
+        }
+
+        // ...non-incremental takes priority over incremental...
+        if self.incremental && !other.incremental {
+            return cmp::Ordering::Greater;
+        }
+        if !self.incremental && other.incremental {
+            return cmp::Ordering::Less;
+        }
+
+        // ...finally, when both are incremental, `other` takes precedence (so
+        // `self` is always sorted after other same-urgency incremental
+        // entries).
+        cmp::Ordering::Greater
     }
 }
 
@@ -1046,6 +1072,29 @@ mod tests {
     }
 
     #[test]
+    fn recv_reset_with_gap() {
+        let mut stream =
+            <Stream>::new(0, 15, 0, true, true, DEFAULT_STREAM_WINDOW);
+        assert!(!stream.recv.almost_full());
+
+        let first = RangeBuf::from(b"hello", 0, false);
+
+        assert_eq!(stream.recv.write(first), Ok(()));
+        // Read one byte.
+        assert_eq!(stream.recv.emit(&mut [0; 1]), Ok((1, false)));
+        // Reset with a final size > than max previously received
+        assert_eq!(
+            stream.recv.reset(0, 10),
+            Ok(RecvBufResetReturn {
+                max_data_delta: 5,
+                // consumed_flowcontrol is 9, since we already read 1 byte
+                consumed_flowcontrol: 9
+            })
+        );
+        assert_eq!(stream.recv.reset(0, 10), Ok(RecvBufResetReturn::zero()));
+    }
+
+    #[test]
     fn recv_reset_dup() {
         let mut stream =
             <Stream>::new(0, 15, 0, true, true, DEFAULT_STREAM_WINDOW);
@@ -1054,8 +1103,14 @@ mod tests {
         let first = RangeBuf::from(b"hello", 0, false);
 
         assert_eq!(stream.recv.write(first), Ok(()));
-        assert_eq!(stream.recv.reset(0, 5), Ok(0));
-        assert_eq!(stream.recv.reset(0, 5), Ok(0));
+        assert_eq!(
+            stream.recv.reset(0, 5),
+            Ok(RecvBufResetReturn {
+                max_data_delta: 0,
+                consumed_flowcontrol: 5
+            })
+        );
+        assert_eq!(stream.recv.reset(0, 5), Ok(RecvBufResetReturn::zero()));
     }
 
     #[test]
@@ -1067,7 +1122,13 @@ mod tests {
         let first = RangeBuf::from(b"hello", 0, false);
 
         assert_eq!(stream.recv.write(first), Ok(()));
-        assert_eq!(stream.recv.reset(0, 5), Ok(0));
+        assert_eq!(
+            stream.recv.reset(0, 5),
+            Ok(RecvBufResetReturn {
+                max_data_delta: 0,
+                consumed_flowcontrol: 5
+            })
+        );
         assert_eq!(stream.recv.reset(0, 10), Err(Error::FinalSize));
     }
 

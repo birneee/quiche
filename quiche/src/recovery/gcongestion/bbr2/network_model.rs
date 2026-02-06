@@ -36,7 +36,6 @@ use crate::recovery::gcongestion::bbr::BandwidthSampler;
 use crate::recovery::gcongestion::bbr2::Params;
 use crate::recovery::gcongestion::Bandwidth;
 use crate::recovery::gcongestion::Lost;
-use crate::recovery::rtt::RttStats;
 
 use super::Acked;
 use super::BBRv2CongestionEvent;
@@ -272,7 +271,6 @@ impl BBRv2NetworkModel {
     pub(super) fn on_packet_sent(
         &mut self, sent_time: Instant, bytes_in_flight: usize,
         packet_number: u64, bytes: usize, is_retransmissible: bool,
-        _rtt_stats: &RttStats,
     ) {
         // Updating the min here ensures a more realistic (0) value when flows
         // exit quiescence.
@@ -500,10 +498,11 @@ impl BBRv2NetworkModel {
         // sample_max_bandwidth will be None if the loss is triggered by a timer
         // expiring. Ideally we'd use the most recent bandwidth sample,
         // but bandwidth_latest is safer than None.
-        if congestion_event.sample_max_bandwidth.is_some() {
+        if let Some(sample_max_bandwidth) = congestion_event.sample_max_bandwidth
+        {
             // bandwidth_latest is the max bandwidth for the round, but to allow
             // fast, conservation style response to loss, use the last sample.
-            last_bandwidth = congestion_event.sample_max_bandwidth.unwrap();
+            last_bandwidth = sample_max_bandwidth;
         }
         if self.pacing_gain > params.full_bw_threshold {
             // In STARTUP, `pacing_gain` is applied to `bandwidth_lo` in
@@ -616,6 +615,12 @@ impl BBRv2NetworkModel {
             self.full_bandwidth_baseline = self.max_bandwidth();
             self.rounds_without_bandwidth_growth = 0;
             return true;
+        }
+
+        if !congestion_event.last_packet_send_state.is_valid {
+            // last_packet_send_state not available because the
+            // congestion event did not contain any non-ACK frames.
+            return false;
         }
 
         let ignore_round = self.ignore_app_limited_for_no_bandwidth_growth &&
