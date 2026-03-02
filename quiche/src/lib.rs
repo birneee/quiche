@@ -2291,7 +2291,7 @@ impl<F: BufFactory> Connection<F> {
                 protocol_type: None,
                 reference_time: Some(
                     t.duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_millis() as f64)
+                        .map(|d| d.as_secs_f64() * 1000.0)
                         .unwrap_or(0.0),
                 ),
                 time_format: Some("relative".to_string()),
