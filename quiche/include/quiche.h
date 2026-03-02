@@ -134,6 +134,9 @@ enum quiche_error {
     // The peer send an ACK frame for a skipped packet used for Optimistic ACK
     // mitigation.
     QUICHE_ERR_OPTIMISTIC_ACK_DETECTED = -22,
+
+    /// An invalid DCID was used when connecting to a remote peer.
+    QUICHE_ERR_INVALID_DCID_INITIALIZATION = -23,
 };
 
 // Returns a human readable string with the quiche version number.
@@ -234,8 +237,7 @@ void quiche_config_set_initial_congestion_window_packets(quiche_config *config, 
 enum quiche_cc_algorithm {
     QUICHE_CC_RENO = 0,
     QUICHE_CC_CUBIC = 1,
-    QUICHE_CC_BBR = 2,
-    QUICHE_CC_BBR2 = 3,
+    QUICHE_CC_BBR2_GCONGESTION = 4,
 };
 
 // Sets the congestion control algorithm used.
@@ -322,6 +324,13 @@ quiche_conn *quiche_conn_new_with_tls(const uint8_t *scid, size_t scid_len,
                                       const struct sockaddr *peer, socklen_t peer_len,
                                       const quiche_config *config, void *ssl,
                                       bool is_server);
+
+// Needs to have custom-client-dcid feature enabled on compile time. Otherwise will always return NULL.
+quiche_conn *quiche_conn_new_with_tls_and_client_dcid(const uint8_t *scid, size_t scid_len,
+                                      const uint8_t *dcid, size_t dcid_len,
+                                      const struct sockaddr *local, socklen_t local_len,
+                                      const struct sockaddr *peer, socklen_t peer_len,
+                                      const quiche_config *config, void *ssl);
 
 // Enables keylog to the specified file path. Returns true on success.
 bool quiche_conn_set_keylog_path(quiche_conn *conn, const char *path);

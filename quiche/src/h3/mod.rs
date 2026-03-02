@@ -3244,6 +3244,7 @@ pub fn grease_value() -> u64 {
 }
 
 #[doc(hidden)]
+#[cfg(any(test, feature = "internal"))]
 pub mod testing {
     use super::*;
 

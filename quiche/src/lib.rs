@@ -1324,7 +1324,13 @@ where
     flow_control: flowcontrol::FlowControl,
 
     /// Whether we send MAX_DATA frame.
-    almost_full: bool,
+    should_send_max_data: bool,
+
+    /// True if there is a pending MAX_STREAMS_BIDI frame to send.
+    should_send_max_streams_bidi: bool,
+
+    /// True if there is a pending MAX_STREAMS_UNI frame to send.
+    should_send_max_streams_uni: bool,
 
     /// Number of stream data bytes that can be buffered.
     tx_cap: usize,
@@ -1502,8 +1508,9 @@ where
 ///
 /// The `scid` parameter represents the server's source connection ID, while
 /// the optional `odcid` parameter represents the original destination ID the
-/// client sent before a stateless retry (this is only required when using
-/// the [`retry()`] function).
+/// client sent before a Retry packet (this is only required when using the
+/// [`retry()`] function). See also the [`accept_with_retry()`] function for
+/// more advanced retry cases.
 ///
 /// [`retry()`]: fn.retry.html
 ///
@@ -1517,14 +1524,12 @@ where
 /// let conn = quiche::accept(&scid, None, local, peer, &mut config)?;
 /// # Ok::<(), quiche::Error>(())
 /// ```
-#[inline]
+#[inline(always)]
 pub fn accept(
     scid: &ConnectionId, odcid: Option<&ConnectionId>, local: SocketAddr,
     peer: SocketAddr, config: &mut Config,
 ) -> Result<Connection> {
-    let conn = Connection::new(scid, odcid, local, peer, config, true)?;
-
-    Ok(conn)
+    accept_with_buf_factory(scid, odcid, local, peer, config)
 }
 
 /// Creates a new server-side connection, with a custom buffer generation
@@ -1537,9 +1542,48 @@ pub fn accept_with_buf_factory<F: BufFactory>(
     scid: &ConnectionId, odcid: Option<&ConnectionId>, local: SocketAddr,
     peer: SocketAddr, config: &mut Config,
 ) -> Result<Connection<F>> {
-    let conn = Connection::new(scid, odcid, local, peer, config, true)?;
+    // For connections with `odcid` set, we historically used `retry_source_cid =
+    // scid`. Keep this behavior to preserve backwards compatibility.
+    // `accept_with_retry` allows the SCIDs to be specified separately.
+    let retry_cids = odcid.map(|odcid| RetryConnectionIds {
+        original_destination_cid: odcid,
+        retry_source_cid: scid,
+    });
+    Connection::new(scid, retry_cids, None, local, peer, config, true)
+}
 
-    Ok(conn)
+/// A wrapper for connection IDs used in [`accept_with_retry`].
+pub struct RetryConnectionIds<'a> {
+    /// The DCID of the first Initial packet received by the server, which
+    /// triggered the Retry packet.
+    pub original_destination_cid: &'a ConnectionId<'a>,
+    /// The SCID of the Retry packet sent by the server. This can be different
+    /// from the new connection's SCID.
+    pub retry_source_cid: &'a ConnectionId<'a>,
+}
+
+/// Creates a new server-side connection after the client responded to a Retry
+/// packet.
+///
+/// To generate a Retry packet in the first place, use the [`retry()`] function.
+///
+/// The `scid` parameter represents the server's source connection ID, which can
+/// be freshly generated after the application has successfully verified the
+/// Retry. `retry_cids` is used to tie the new connection to the Initial + Retry
+/// exchange that preceded the connection's creation.
+///
+/// The DCID of the client's Initial packet is inherently untrusted data. It is
+/// safe to use the DCID in the `retry_source_cid` field of the
+/// `RetryConnectionIds` provided to this function. However, using the Initial's
+/// DCID for the `scid` parameter carries risks. Applications are advised to
+/// implement their own DCID validation steps before using the DCID in that
+/// manner.
+#[inline]
+pub fn accept_with_retry<F: BufFactory>(
+    scid: &ConnectionId, retry_cids: RetryConnectionIds, local: SocketAddr,
+    peer: SocketAddr, config: &mut Config,
+) -> Result<Connection<F>> {
+    Connection::new(scid, Some(retry_cids), None, local, peer, config, true)
 }
 
 /// Creates a new client-side connection.
@@ -1565,7 +1609,34 @@ pub fn connect(
     server_name: Option<&str>, scid: &ConnectionId, local: SocketAddr,
     peer: SocketAddr, config: &mut Config,
 ) -> Result<Connection> {
-    let mut conn = Connection::new(scid, None, local, peer, config, false)?;
+    let mut conn = Connection::new(scid, None, None, local, peer, config, false)?;
+
+    if let Some(server_name) = server_name {
+        conn.handshake.set_host_name(server_name)?;
+    }
+
+    Ok(conn)
+}
+
+/// Creates a new client-side connection using the given DCID initially.
+///
+/// Be aware that [RFC 9000] places requirements for unpredictability and length
+/// on the client DCID field. This function is dangerous if these  requirements
+/// are not satisfied.
+///
+/// The `scid` parameter is used as the connection's source connection ID, while
+/// the optional `server_name` parameter is used to verify the peer's
+/// certificate.
+///
+/// [RFC 9000]: <https://datatracker.ietf.org/doc/html/rfc9000#section-7.2-3>
+#[cfg(feature = "custom-client-dcid")]
+#[cfg_attr(docsrs, doc(cfg(feature = "custom-client-dcid")))]
+pub fn connect_with_dcid(
+    server_name: Option<&str>, scid: &ConnectionId, dcid: &ConnectionId,
+    local: SocketAddr, peer: SocketAddr, config: &mut Config,
+) -> Result<Connection> {
+    let mut conn =
+        Connection::new(scid, None, Some(dcid), local, peer, config, false)?;
 
     if let Some(server_name) = server_name {
         conn.handshake.set_host_name(server_name)?;
@@ -1584,7 +1655,31 @@ pub fn connect_with_buffer_factory<F: BufFactory>(
     server_name: Option<&str>, scid: &ConnectionId, local: SocketAddr,
     peer: SocketAddr, config: &mut Config,
 ) -> Result<Connection<F>> {
-    let mut conn = Connection::new(scid, None, local, peer, config, false)?;
+    let mut conn = Connection::new(scid, None, None, local, peer, config, false)?;
+
+    if let Some(server_name) = server_name {
+        conn.handshake.set_host_name(server_name)?;
+    }
+
+    Ok(conn)
+}
+
+/// Creates a new client-side connection, with a custom buffer generation
+/// method using the given dcid initially.
+/// Be aware the RFC places requirements for unpredictability and length
+/// on the client DCID field.
+/// [`RFC9000`]:  https://datatracker.ietf.org/doc/html/rfc9000#section-7.2-3
+///
+/// The buffers generated can be anything that can be drereferenced as a byte
+/// slice. See [`connect`] and [`BufFactory`] for more info.
+#[cfg(feature = "custom-client-dcid")]
+#[cfg_attr(docsrs, doc(cfg(feature = "custom-client-dcid")))]
+pub fn connect_with_dcid_and_buffer_factory<F: BufFactory>(
+    server_name: Option<&str>, scid: &ConnectionId, dcid: &ConnectionId,
+    local: SocketAddr, peer: SocketAddr, config: &mut Config,
+) -> Result<Connection<F>> {
+    let mut conn =
+        Connection::new(scid, None, Some(dcid), local, peer, config, false)?;
 
     if let Some(server_name) = server_name {
         conn.handshake.set_host_name(server_name)?;
@@ -1777,17 +1872,47 @@ impl Default for QlogInfo {
 
 impl<F: BufFactory> Connection<F> {
     fn new(
-        scid: &ConnectionId, odcid: Option<&ConnectionId>, local: SocketAddr,
-        peer: SocketAddr, config: &mut Config, is_server: bool,
+        scid: &ConnectionId, retry_cids: Option<RetryConnectionIds>,
+        client_dcid: Option<&ConnectionId>, local: SocketAddr, peer: SocketAddr,
+        config: &mut Config, is_server: bool,
     ) -> Result<Connection<F>> {
         let tls = config.tls_ctx.new_handshake()?;
-        Connection::with_tls(scid, odcid, local, peer, config, tls, is_server)
+        Connection::with_tls(
+            scid,
+            retry_cids,
+            client_dcid,
+            local,
+            peer,
+            config,
+            tls,
+            is_server,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn with_tls(
-        scid: &ConnectionId, odcid: Option<&ConnectionId>, local: SocketAddr,
-        peer: SocketAddr, config: &Config, tls: tls::Handshake, is_server: bool,
+        scid: &ConnectionId, retry_cids: Option<RetryConnectionIds>,
+        client_dcid: Option<&ConnectionId>, local: SocketAddr, peer: SocketAddr,
+        config: &Config, tls: tls::Handshake, is_server: bool,
     ) -> Result<Connection<F>> {
+        if retry_cids.is_some() && client_dcid.is_some() {
+            // These are exclusive, the caller should only specify one or the
+            // other.
+            return Err(Error::InvalidDcidInitialization);
+        }
+        #[cfg(feature = "custom-client-dcid")]
+        if let Some(client_dcid) = client_dcid {
+            // The Minimum length is 8.
+            // See https://datatracker.ietf.org/doc/html/rfc9000#section-7.2-3
+            if client_dcid.to_vec().len() < 8 {
+                return Err(Error::InvalidDcidInitialization);
+            }
+        }
+        #[cfg(not(feature = "custom-client-dcid"))]
+        if client_dcid.is_some() {
+            return Err(Error::InvalidDcidInitialization);
+        }
+
         let max_rx_data = config.local_transport_params.initial_max_data;
 
         let scid_as_hex: Vec<String> =
@@ -1810,8 +1935,8 @@ impl<F: BufFactory> Connection<F> {
             Some(config),
         );
 
-        // If we did stateless retry assume the peer's address is verified.
-        path.verified_peer_address = odcid.is_some();
+        // If we sent a Retry assume the peer's address is verified.
+        path.verified_peer_address = retry_cids.is_some();
         // Assume clients validate the server's address implicitly.
         path.peer_verified_local_address = is_server;
 
@@ -1892,7 +2017,9 @@ impl<F: BufFactory> Connection<F> {
                 cmp::min(max_rx_data / 2 * 3, DEFAULT_CONNECTION_WINDOW),
                 config.max_connection_window,
             ),
-            almost_full: false,
+            should_send_max_data: false,
+            should_send_max_streams_bidi: false,
+            should_send_max_streams_uni: false,
 
             tx_cap: 0,
             tx_cap_factor: config.tx_cap_factor,
@@ -1994,12 +2121,13 @@ impl<F: BufFactory> Connection<F> {
             max_amplification_factor: config.max_amplification_factor,
         };
 
-        if let Some(odcid) = odcid {
+        if let Some(retry_cids) = retry_cids {
             conn.local_transport_params
-                .original_destination_connection_id = Some(odcid.to_vec().into());
+                .original_destination_connection_id =
+                Some(retry_cids.original_destination_cid.to_vec().into());
 
             conn.local_transport_params.retry_source_connection_id =
-                Some(conn.ids.get_scid(0)?.cid.to_vec().into());
+                Some(retry_cids.retry_source_cid.to_vec().into());
 
             conn.did_retry = true;
         }
@@ -2014,11 +2142,18 @@ impl<F: BufFactory> Connection<F> {
 
         conn.encode_transport_params()?;
 
-        // Derive initial secrets for the client. We can do this here because
-        // we already generated the random destination connection ID.
         if !is_server {
-            let mut dcid = [0; 16];
-            rand::rand_bytes(&mut dcid[..]);
+            let dcid = if let Some(client_dcid) = client_dcid {
+                // We already had an dcid generated for us, use it.
+                client_dcid.to_vec()
+            } else {
+                // Derive initial secrets for the client. We can do this here
+                // because we already generated the random
+                // destination connection ID.
+                let mut dcid = [0; 16];
+                rand::rand_bytes(&mut dcid[..]);
+                dcid.to_vec()
+            };
 
             let (aead_open, aead_seal) = crypto::derive_initial_key_material(
                 &dcid,
@@ -3934,10 +4069,24 @@ impl<F: BufFactory> Connection<F> {
                         stream_id,
                         error_code,
                         final_size,
+                    } => {
+                        self.streams
+                            .insert_reset(stream_id, error_code, final_size);
+                    },
+
+                    frame::Frame::StopSending {
+                        stream_id,
+                        error_code,
                     } =>
-                        if self.streams.get(stream_id).is_some() {
-                            self.streams
-                                .insert_reset(stream_id, error_code, final_size);
+                    // We only need to retransmit the STOP_SENDING frame if
+                    // the stream is still active and not FIN'd. Even if the
+                    // packet was lost, if the application has the final
+                    // size at this point there is no need to retransmit.
+                        if let Some(stream) = self.streams.get(stream_id) {
+                            if !stream.recv.is_fin() {
+                                self.streams
+                                    .insert_stopped(stream_id, error_code);
+                            }
                         },
 
                     // Retransmit HANDSHAKE_DONE only if it hasn't been acked at
@@ -3953,7 +4102,15 @@ impl<F: BufFactory> Connection<F> {
                     },
 
                     frame::Frame::MaxData { .. } => {
-                        self.almost_full = true;
+                        self.should_send_max_data = true;
+                    },
+
+                    frame::Frame::MaxStreamsUni { .. } => {
+                        self.should_send_max_streams_uni = true;
+                    },
+
+                    frame::Frame::MaxStreamsBidi { .. } => {
+                        self.should_send_max_streams_bidi = true;
                     },
 
                     frame::Frame::NewConnectionId { seq_num, .. } => {
@@ -4182,8 +4339,6 @@ impl<F: BufFactory> Connection<F> {
 
         let mut challenge_data = None;
 
-        let active_path = self.paths.get_active_mut()?;
-
         if pkt_type == Type::Short {
             // Create PMTUD probe.
             //
@@ -4196,64 +4351,64 @@ impl<F: BufFactory> Connection<F> {
             // In addition, the PMTUD probe is only generated when the handshake
             // is confirmed, to avoid interfering with the handshake
             // (e.g. due to the anti-amplification limits).
-            let should_probe_pmtu = active_path.should_send_pmtu_probe(
-                self.handshake_confirmed,
-                self.handshake_completed,
-                out_len,
-                is_closing,
-                frames.is_empty(),
-            );
+            if let Ok(active_path) = self.paths.get_active_mut() {
+                let should_probe_pmtu = active_path.should_send_pmtu_probe(
+                    self.handshake_confirmed,
+                    self.handshake_completed,
+                    out_len,
+                    is_closing,
+                    frames.is_empty(),
+                );
 
-            if should_probe_pmtu {
-                if let Some(pmtud) = active_path.pmtud.as_mut() {
-                    let probe_size = pmtud.get_probe_size();
-                    trace!(
+                if should_probe_pmtu {
+                    if let Some(pmtud) = active_path.pmtud.as_mut() {
+                        let probe_size = pmtud.get_probe_size();
+                        trace!(
                         "{} sending pmtud probe pmtu_probe={} estimated_pmtu={}",
                         self.trace_id,
                         probe_size,
                         pmtud.get_current_mtu(),
                     );
 
-                    left = probe_size;
+                        left = probe_size;
 
-                    match left.checked_sub(overhead) {
-                        Some(v) => left = v,
+                        match left.checked_sub(overhead) {
+                            Some(v) => left = v,
 
-                        None => {
-                            // We can't send more because there isn't enough space
-                            // available in the output buffer.
-                            //
-                            // This usually happens when we try to send a new
-                            // packet but failed
-                            // because cwnd is almost full.
-                            //
-                            // In such case app_limited is set to false here to
-                            // make cwnd grow when ACK
-                            // is received.
-                            active_path.recovery.update_app_limited(false);
-                            return Err(Error::Done);
-                        },
-                    }
+                            None => {
+                                // We can't send more because there isn't enough
+                                // space available in the output buffer.
+                                //
+                                // This usually happens when we try to send a new
+                                // packet but failed because cwnd is almost full.
+                                //
+                                // In such case app_limited is set to false here
+                                // to make cwnd grow when ACK is received.
+                                active_path.recovery.update_app_limited(false);
+                                return Err(Error::Done);
+                            },
+                        }
 
-                    let frame = frame::Frame::Padding {
-                        len: probe_size - overhead - 1,
-                    };
-
-                    if push_frame_to_pkt!(b, frames, frame, left) {
-                        let frame = frame::Frame::Ping {
-                            mtu_probe: Some(probe_size),
+                        let frame = frame::Frame::Padding {
+                            len: probe_size - overhead - 1,
                         };
 
                         if push_frame_to_pkt!(b, frames, frame, left) {
-                            ack_eliciting = true;
-                            in_flight = true;
-                        }
-                    }
+                            let frame = frame::Frame::Ping {
+                                mtu_probe: Some(probe_size),
+                            };
 
-                    // Reset probe flag after sending to prevent duplicate probes
-                    // in a single flight.
-                    pmtud.set_in_flight(true);
-                    is_pmtud_probe = true;
+                            if push_frame_to_pkt!(b, frames, frame, left) {
+                                ack_eliciting = true;
+                                in_flight = true;
+                            }
+                        }
+
+                        // Reset probe flag after sending to prevent duplicate
+                        // probes in a single flight.
+                        pmtud.set_in_flight(true);
+                        is_pmtud_probe = true;
+                    }
                 }
             }
 
@@ -4330,13 +4485,16 @@ impl<F: BufFactory> Connection<F> {
             }
 
             // Create MAX_STREAMS_BIDI frame.
-            if self.streams.should_update_max_streams_bidi() {
+            if self.streams.should_update_max_streams_bidi() ||
+                self.should_send_max_streams_bidi
+            {
                 let frame = frame::Frame::MaxStreamsBidi {
                     max: self.streams.max_streams_bidi_next(),
                 };
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
                     self.streams.update_max_streams_bidi();
+                    self.should_send_max_streams_bidi = false;
 
                     ack_eliciting = true;
                     in_flight = true;
@@ -4344,13 +4502,16 @@ impl<F: BufFactory> Connection<F> {
             }
 
             // Create MAX_STREAMS_UNI frame.
-            if self.streams.should_update_max_streams_uni() {
+            if self.streams.should_update_max_streams_uni() ||
+                self.should_send_max_streams_uni
+            {
                 let frame = frame::Frame::MaxStreamsUni {
                     max: self.streams.max_streams_uni_next(),
                 };
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
                     self.streams.update_max_streams_uni();
+                    self.should_send_max_streams_uni = false;
 
                     ack_eliciting = true;
                     in_flight = true;
@@ -4384,8 +4545,13 @@ impl<F: BufFactory> Connection<F> {
                     },
                 };
 
-                // Autotune the stream window size.
-                stream.recv.autotune_window(now, path.recovery.rtt());
+                // Autotune the stream window size, but only if this is not a
+                // retransmission (on a retransmit the stream will be in
+                // `self.streams.almost_full()` but it's `almost_full()`
+                // method returns false.
+                if stream.recv.almost_full() {
+                    stream.recv.autotune_window(now, path.recovery.rtt());
+                }
 
                 let frame = frame::Frame::MaxStreamData {
                     stream_id,
@@ -4407,26 +4573,26 @@ impl<F: BufFactory> Connection<F> {
                     flow_control.ensure_window_lower_bound(
                         (recv_win as f64 * CONNECTION_WINDOW_FACTOR) as u64,
                     );
-
-                    // Also send MAX_DATA when MAX_STREAM_DATA is sent, to avoid a
-                    // potential race condition.
-                    self.almost_full = true;
                 }
             }
 
             // Create MAX_DATA frame as needed.
-            if self.almost_full &&
+            if flow_control.should_update_max_data() &&
                 flow_control.max_data() < flow_control.max_data_next()
             {
-                // Autotune the connection window size.
+                // Autotune the connection window size. We only tune the window
+                // if we are sending an "organic" update, not on retransmits.
                 flow_control.autotune_window(now, path.recovery.rtt());
+                self.should_send_max_data = true;
+            }
 
+            if self.should_send_max_data {
                 let frame = frame::Frame::MaxData {
                     max: flow_control.max_data_next(),
                 };
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
-                    self.almost_full = false;
+                    self.should_send_max_data = false;
 
                     // Commits the new max_rx_data limit.
                     flow_control.update_max_data(now);
@@ -5338,10 +5504,6 @@ impl<F: BufFactory> Connection<F> {
             q.add_event_data_with_instant(ev_data, now).ok();
         });
 
-        if self.should_update_max_data() {
-            self.almost_full = true;
-        }
-
         if priority_key.incremental && readable {
             // Shuffle the incremental stream to the back of the queue.
             self.streams.remove_readable(&priority_key);
@@ -5708,9 +5870,6 @@ impl<F: BufFactory> Connection<F> {
             Shutdown::Read => {
                 let consumed = stream.recv.shutdown()?;
                 self.flow_control.add_consumed(consumed);
-                if self.flow_control.should_update_max_data() {
-                    self.almost_full = true;
-                }
 
                 if !stream.recv.is_fin() {
                     self.streams.insert_stopped(stream_id, err);
@@ -7452,9 +7611,14 @@ impl<F: BufFactory> Connection<F> {
             Ok(_) => (),
 
             Err(Error::Done) => {
-                // Apply in-handshake configuration from callbacks before any
-                // packet has been sent.
-                if self.sent_count == 0 {
+                // Apply in-handshake configuration from callbacks if the path's
+                // Recovery module can still be reinitilized.
+                if self
+                    .paths
+                    .get_active()
+                    .map(|p| p.can_reinit_recovery())
+                    .unwrap_or(false)
+                {
                     if ex_data.recovery_config != self.recovery_config {
                         if let Ok(path) = self.paths.get_active_mut() {
                             self.recovery_config = ex_data.recovery_config;
@@ -7624,13 +7788,16 @@ impl<F: BufFactory> Connection<F> {
         let send_path = self.paths.get(send_pid)?;
         if (self.is_established() || self.is_in_early_data()) &&
             (self.should_send_handshake_done() ||
-                self.almost_full ||
+                self.flow_control.should_update_max_data() ||
+                self.should_send_max_data ||
                 self.blocked_limit.is_some() ||
                 self.dgram_send_queue.has_pending() ||
                 self.local_error
                     .as_ref()
                     .is_some_and(|conn_err| conn_err.is_app) ||
+                self.should_send_max_streams_bidi ||
                 self.streams.should_update_max_streams_bidi() ||
+                self.should_send_max_streams_uni ||
                 self.streams.should_update_max_streams_uni() ||
                 self.streams.has_flushable() ||
                 self.streams.has_almost_full() ||
@@ -7812,11 +7979,6 @@ impl<F: BufFactory> Connection<F> {
                 // flow-control
                 self.flow_control.add_consumed(consumed_flowcontrol);
 
-                // ... and check if need to send an updated MAX_DATA frame
-                if self.should_update_max_data() {
-                    self.almost_full = true;
-                }
-
                 self.reset_stream_remote_count =
                     self.reset_stream_remote_count.saturating_add(1);
             },
@@ -7987,10 +8149,6 @@ impl<F: BufFactory> Connection<F> {
                     // the received data as consumed, which might trigger a flow
                     // control update.
                     self.flow_control.add_consumed(max_off_delta);
-
-                    if self.should_update_max_data() {
-                        self.almost_full = true;
-                    }
                 }
             },
 
@@ -8251,14 +8409,6 @@ impl<F: BufFactory> Connection<F> {
         }
 
         trace!("{} dropped epoch {} state", self.trace_id, epoch);
-    }
-
-    /// Returns true if the connection-level flow control needs to be updated.
-    ///
-    /// This happens when the new max data limit is at least double the amount
-    /// of data that can be received before blocking.
-    fn should_update_max_data(&self) -> bool {
-        self.flow_control.should_update_max_data()
     }
 
     /// Returns the connection level flow control limit.
@@ -8872,6 +9022,7 @@ impl std::fmt::Debug for Stats {
 }
 
 #[doc(hidden)]
+#[cfg(any(test, feature = "internal"))]
 pub mod test_utils;
 
 #[cfg(test)]

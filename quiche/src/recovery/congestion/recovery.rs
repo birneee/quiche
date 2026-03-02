@@ -1001,7 +1001,9 @@ impl RecoveryOps for LegacyRecovery {
             cwnd: self.cwnd() as u64,
             bytes_in_flight: self.bytes_in_flight.get() as u64,
             ssthresh: Some(self.congestion.ssthresh.get() as u64),
-            pacing_rate: 0,
+            lost_packets: Some(self.congestion.lost_count as u64),
+            lost_bytes: Some(self.bytes_lost),
+            ..Default::default()
         };
 
         self.qlog_metrics.maybe_update(qlog_metrics)

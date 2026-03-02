@@ -36,7 +36,7 @@ pub struct Pipe {
 }
 
 impl Pipe {
-    pub fn new(cc_algorithm_name: &str) -> Result<Pipe> {
+    pub fn default_config(cc_algorithm_name: &str) -> Result<Config> {
         let mut config = Config::new(PROTOCOL_VERSION)?;
         assert_eq!(config.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
         config.load_cert_chain_from_pem_file("examples/cert.crt")?;
@@ -51,7 +51,29 @@ impl Pipe {
         config.set_max_idle_timeout(180_000);
         config.verify_peer(false);
         config.set_ack_delay_exponent(8);
+        Ok(config)
+    }
 
+    #[cfg(feature = "boringssl-boring-crate")]
+    pub fn default_tls_ctx_builder() -> boring::ssl::SslContextBuilder {
+        let mut ctx_builder =
+            boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls())
+                .unwrap();
+        ctx_builder
+            .set_certificate_chain_file("examples/cert.crt")
+            .unwrap();
+        ctx_builder
+            .set_private_key_file(
+                "examples/cert.key",
+                boring::ssl::SslFiletype::PEM,
+            )
+            .unwrap();
+
+        ctx_builder
+    }
+
+    pub fn new(cc_algorithm_name: &str) -> Result<Pipe> {
+        let mut config = Self::default_config(cc_algorithm_name)?;
         Pipe::with_config(&mut config)
     }
 
@@ -513,7 +535,7 @@ pub fn create_cid_and_reset_token(
 ) -> (ConnectionId<'static>, u128) {
     let mut cid = vec![0; cid_len];
     rand::rand_bytes(&mut cid[..]);
-    let cid = ConnectionId::from_ref(&cid).into_owned();
+    let cid = ConnectionId::from(cid);
 
     let mut reset_token = [0; 16];
     rand::rand_bytes(&mut reset_token);
@@ -553,4 +575,48 @@ pub fn stream_recv_discard(
     } else {
         conn.stream_recv(stream_id, &mut buf)
     }
+}
+
+/// Triggers ACK-based loss detection for packets sent by `sender` before this
+/// call.
+///
+/// This works by sending multiple PING packets from the sender and having the
+/// receiver ACK them. Since loss detection uses a packet threshold, this
+/// function sends as many packets as needed to ensure any previously
+/// unacknowledged packets from the sender are detected as lost.
+#[cfg(test)]
+pub fn trigger_ack_based_loss(
+    sender: &mut Connection, receiver: &mut Connection,
+) {
+    let mut buf = [0; 65535];
+
+    // Use the active path's packet loss threshold.
+    let pkt_thresh = sender
+        .paths
+        .get_active()
+        .unwrap()
+        .recovery
+        .pkt_thresh()
+        .unwrap();
+
+    for _ in 0..pkt_thresh {
+        sender.send_ack_eliciting().unwrap();
+        let (len, _) = sender.send(&mut buf).unwrap();
+
+        let info = RecvInfo {
+            to: receiver.paths.get_active().unwrap().local_addr(),
+            from: receiver.paths.get_active().unwrap().peer_addr(),
+        };
+        receiver.recv(&mut buf[..len], info).unwrap();
+    }
+
+    // Receiver sends ACK for the new packets.
+    let (ack_len, _) = receiver.send(&mut buf).unwrap();
+
+    // Sender receives ACK, triggering loss detection.
+    let info = RecvInfo {
+        to: sender.paths.get_active().unwrap().local_addr(),
+        from: sender.paths.get_active().unwrap().peer_addr(),
+    };
+    sender.recv(&mut buf[..ack_len], info).unwrap();
 }
