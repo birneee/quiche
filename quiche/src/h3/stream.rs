@@ -364,25 +364,24 @@ impl Stream {
 
                         (frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID, _) => {
                             self.ty = Some(Type::WebTransport);
-                            self.frame_type = Some(frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID);
+                            self.frame_type =
+                                Some(frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID);
                             self.state = State::Ignore;
                             return Ok(());
-                        }
+                        },
 
                         // All other frames can be ignored regardless of stream
                         // state.
                         _ => (),
                     }
-                } else {
-                    match (ty, self.remote_initialized) {
-                        (frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID, _) => {
-                            self.ty = Some(Type::WebTransport);
-                            self.frame_type = Some(frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID);
-                            self.state = State::Ignore;
-                            return Ok(());
-                        }
-                        _ => (),
-                    }
+                } else if let (frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID, _) =
+                    (ty, self.remote_initialized)
+                {
+                    self.ty = Some(Type::WebTransport);
+                    self.frame_type =
+                        Some(frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID);
+                    self.state = State::Ignore;
+                    return Ok(());
                 }
             },
 

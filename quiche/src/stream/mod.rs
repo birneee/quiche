@@ -934,10 +934,15 @@ impl StreamIter {
     #[inline]
     pub fn filter<P>(&self, mut predicate: P) -> Self
     where
-        P: FnMut(&u64) -> bool
+        P: FnMut(&u64) -> bool,
     {
         Self {
-            streams: self.streams.iter().filter(|&s| predicate(s)).copied().collect(),
+            streams: self
+                .streams
+                .iter()
+                .filter(|&s| predicate(s))
+                .copied()
+                .collect(),
             index: 0,
         }
     }

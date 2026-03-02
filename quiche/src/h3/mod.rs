@@ -1169,19 +1169,24 @@ impl Connection {
     /// The session id must be sent by the upper layer.
     ///
     /// If successful, the ID of the stream is returned.
-    /// `InternalError` is returned when `webtransport_streams_enabled` is not set.
+    /// `InternalError` is returned when `webtransport_streams_enabled` is not
+    /// set.
     pub fn open_webtransport_stream(
         &mut self, conn: &mut super::Connection, bidi: bool,
     ) -> Result<u64> {
         if !self.webtransport_streams_enabled {
-            return Err(Error::InternalError)
+            return Err(Error::InternalError);
         }
 
         Ok(if bidi {
             let stream_id = self.next_request_stream_id;
-            const HDR_LEN: usize = octets::varint_len(frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID);
+            const HDR_LEN: usize =
+                octets::varint_len(frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID);
             let mut hdr = [0u8; HDR_LEN];
-            octets::OctetsMut::with_slice(&mut hdr).put_varint_with_len(frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID, HDR_LEN)?;
+            octets::OctetsMut::with_slice(&mut hdr).put_varint_with_len(
+                frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID,
+                HDR_LEN,
+            )?;
 
             conn.stream_send(stream_id, &[], false)?; // only to create stream state
             if conn.stream_capacity(stream_id)? < HDR_LEN {
@@ -1201,11 +1206,15 @@ impl Connection {
                 .ok_or(Error::IdError)?;
 
             stream_id
-        } else  {
+        } else {
             let stream_id = self.next_uni_stream_id;
-            const HDR_LEN: usize = octets::varint_len(stream::WEBTRANSPORT_STREAM_TYPE_ID);
+            const HDR_LEN: usize =
+                octets::varint_len(stream::WEBTRANSPORT_STREAM_TYPE_ID);
             let mut hdr = [0u8; HDR_LEN];
-            octets::OctetsMut::with_slice(&mut hdr).put_varint_with_len(stream::WEBTRANSPORT_STREAM_TYPE_ID, HDR_LEN)?;
+            octets::OctetsMut::with_slice(&mut hdr).put_varint_with_len(
+                stream::WEBTRANSPORT_STREAM_TYPE_ID,
+                HDR_LEN,
+            )?;
 
             conn.stream_send(stream_id, &[], false)?; // only to create stream state
             if conn.stream_capacity(stream_id)? < HDR_LEN {
@@ -2569,7 +2578,9 @@ impl Connection {
 
                     let mut ty = stream::Type::deserialize(varint)?;
 
-                    if matches!(ty, stream::Type::WebTransport) && !self.webtransport_streams_enabled {
+                    if matches!(ty, stream::Type::WebTransport)
+                        && !self.webtransport_streams_enabled
+                    {
                         // downgrade to `Unknown`
                         ty = stream::Type::Unknown
                     }
@@ -3231,10 +3242,14 @@ impl Connection {
 
     /// Returns an iterator over WebTransport streams that have outstanding data to read.
     /// Iterator is always empty if `webtransport_streams_enabled` is not set.
-    pub fn readable_webtransport_streams(&self, conn: &super::Connection) -> super::StreamIter {
-        super::StreamIter::filter(&conn.readable(), |stream_id| self.streams.get(&stream_id).unwrap().ty() == Some(stream::Type::WebTransport))
+    pub fn readable_webtransport_streams(
+        &self, conn: &super::Connection,
+    ) -> super::StreamIter {
+        super::StreamIter::filter(&conn.readable(), |stream_id| {
+            self.streams.get(stream_id).unwrap().ty()
+                == Some(stream::Type::WebTransport)
+        })
     }
-
 }
 
 /// Generates an HTTP/3 GREASE variable length integer.
