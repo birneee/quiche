@@ -572,6 +572,8 @@ pub struct Config {
     /// additional settings are settings that are not part of the H3
     /// settings explicitly handled above
     additional_settings: Option<Vec<(u64, u64)>>,
+    /// make WebTransport streams available to the upper layer.
+    webtransport_streams_enabled: bool,
 }
 
 impl Config {
@@ -583,6 +585,7 @@ impl Config {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             additional_settings: None,
+            webtransport_streams_enabled: false,
         })
     }
 
@@ -665,6 +668,13 @@ impl Config {
         }
         self.additional_settings = Some(additional_settings);
         Ok(())
+    }
+
+    /// Make WebTransport streams available to the upper layer.
+    ///
+    /// The default value is `false`.
+    pub fn enable_webtransport_streams(&mut self, enabled: bool) {
+        self.webtransport_streams_enabled = enabled;
     }
 }
 
@@ -985,6 +995,7 @@ pub struct Connection {
 
     local_goaway_id: Option<u64>,
     peer_goaway_id: Option<u64>,
+    webtransport_streams_enabled: bool,
 }
 
 impl Connection {
@@ -992,12 +1003,13 @@ impl Connection {
         config: &Config, is_server: bool, enable_dgram: bool,
     ) -> Result<Connection> {
         let initial_uni_stream_id = if is_server { 0x3 } else { 0x2 };
+        let initial_bidi_stream_id = if is_server { 0x1 } else { 0x0 };
         let h3_datagram = if enable_dgram { Some(1) } else { None };
 
         Ok(Connection {
             is_server,
 
-            next_request_stream_id: 0,
+            next_request_stream_id: initial_bidi_stream_id,
 
             next_uni_stream_id: initial_uni_stream_id,
 
@@ -1040,6 +1052,7 @@ impl Connection {
 
             local_goaway_id: None,
             peer_goaway_id: None,
+            webtransport_streams_enabled: config.webtransport_streams_enabled,
         })
     }
 
@@ -1148,6 +1161,80 @@ impl Connection {
             .ok_or(Error::IdError)?;
 
         Ok(stream_id)
+    }
+
+    /// Open a new WebTransport stream.
+    /// The `bidi` argument specifies whether it is bidirectional or not.
+    /// This function already adds the frame or stream type.
+    /// The session id must be sent by the upper layer.
+    ///
+    /// If successful, the ID of the stream is returned.
+    /// `InternalError` is returned when `webtransport_streams_enabled` is not
+    /// set.
+    pub fn open_webtransport_stream(
+        &mut self, conn: &mut super::Connection, bidi: bool,
+    ) -> Result<u64> {
+        if !self.webtransport_streams_enabled {
+            return Err(Error::InternalError);
+        }
+
+        Ok(if bidi {
+            let stream_id = self.next_request_stream_id;
+            const HDR_LEN: usize =
+                octets::varint_len(frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID);
+            let mut hdr = [0u8; HDR_LEN];
+            octets::OctetsMut::with_slice(&mut hdr).put_varint_with_len(
+                frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID,
+                HDR_LEN,
+            )?;
+
+            conn.stream_send(stream_id, &[], false)?; // only to create stream state
+            if conn.stream_capacity(stream_id)? < HDR_LEN {
+                return Err(Error::StreamBlocked);
+            }
+            conn.stream_send(stream_id, &hdr, false)?;
+
+            let mut stream = stream::Stream::new(stream_id, true);
+            stream.set_frame_type(frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID)?;
+            self.streams.insert(stream_id, stream);
+
+            // To avoid skipping stream IDs, we only calculate the next available
+            // stream ID when a request has been successfully buffered.
+            self.next_request_stream_id = self
+                .next_request_stream_id
+                .checked_add(4)
+                .ok_or(Error::IdError)?;
+
+            stream_id
+        } else {
+            let stream_id = self.next_uni_stream_id;
+            const HDR_LEN: usize =
+                octets::varint_len(stream::WEBTRANSPORT_STREAM_TYPE_ID);
+            let mut hdr = [0u8; HDR_LEN];
+            octets::OctetsMut::with_slice(&mut hdr).put_varint_with_len(
+                stream::WEBTRANSPORT_STREAM_TYPE_ID,
+                HDR_LEN,
+            )?;
+
+            conn.stream_send(stream_id, &[], false)?; // only to create stream state
+            if conn.stream_capacity(stream_id)? < HDR_LEN {
+                return Err(Error::StreamBlocked);
+            }
+            conn.stream_send(stream_id, &hdr, false)?;
+
+            let mut stream = stream::Stream::new(stream_id, true);
+            stream.set_ty(stream::Type::WebTransport)?;
+            self.streams.insert(stream_id, stream);
+
+            // To avoid skipping stream IDs, we only calculate the next available
+            // stream ID when a request has been successfully buffered.
+            self.next_uni_stream_id = self
+                .next_uni_stream_id
+                .checked_add(4)
+                .ok_or(Error::IdError)?;
+
+            stream_id
+        })
     }
 
     /// Sends an HTTP/3 response on the specified stream with default priority.
@@ -2489,7 +2576,14 @@ impl Connection {
                         Err(_) => continue,
                     };
 
-                    let ty = stream::Type::deserialize(varint)?;
+                    let mut ty = stream::Type::deserialize(varint)?;
+
+                    if matches!(ty, stream::Type::WebTransport)
+                        && !self.webtransport_streams_enabled
+                    {
+                        // downgrade to `Unknown`
+                        ty = stream::Type::Unknown
+                    }
 
                     if let Err(e) = stream.set_ty(ty) {
                         conn.close(true, e.to_wire(), b"")?;
@@ -2595,6 +2689,8 @@ impl Connection {
                             self.peer_qpack_streams.decoder_stream_id =
                                 Some(stream_id);
                         },
+
+                        stream::Type::WebTransport => {},
 
                         stream::Type::Unknown => {
                             // Unknown stream types are ignored.
@@ -2786,6 +2882,8 @@ impl Connection {
                 },
 
                 stream::State::Finished => break,
+
+                stream::State::Ignore => break,
             }
         }
 
@@ -3140,6 +3238,17 @@ impl Connection {
                 .peer_qpack_streams
                 .decoder_stream_bytes,
         }
+    }
+
+    /// Returns an iterator over WebTransport streams that have outstanding data to read.
+    /// Iterator is always empty if `webtransport_streams_enabled` is not set.
+    pub fn readable_webtransport_streams(
+        &self, conn: &super::Connection,
+    ) -> super::StreamIter {
+        super::StreamIter::filter(&conn.readable(), |stream_id| {
+            self.streams.get(stream_id).unwrap().ty()
+                == Some(stream::Type::WebTransport)
+        })
     }
 }
 
