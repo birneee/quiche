@@ -971,6 +971,41 @@ fn custom_limit_handshake_data(
 }
 
 #[rstest]
+fn amplification_limited_stat() {
+    let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+    config
+        .load_cert_chain_from_pem_file("examples/cert-big.crt")
+        .unwrap();
+    config
+        .load_priv_key_from_pem_file("examples/cert.key")
+        .unwrap();
+    config
+        .set_application_protos(&[b"proto1", b"proto2"])
+        .unwrap();
+
+    let mut pipe = test_utils::Pipe::with_server_config(&mut config).unwrap();
+
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+    // Server sends handshake until amplification budget is exhausted.
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    assert!(!flight.is_empty());
+    assert!(pipe.server.stats().amplification_limited_count > 0);
+    // Complete handshake and verifies client address.
+    test_utils::process_flight(&mut pipe.client, flight).unwrap();
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+    // Counter should not increment after address verification.
+    let count_after_handshake = pipe.server.stats().amplification_limited_count;
+    let flight = test_utils::emit_flight(&mut pipe.server);
+    assert!(flight.is_ok() || flight == Err(Error::Done));
+    assert_eq!(
+        pipe.server.stats().amplification_limited_count,
+        count_after_handshake
+    );
+}
+
+#[rstest]
 fn streamio(#[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str) {
     let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
     assert_eq!(pipe.handshake(), Ok(()));
@@ -987,6 +1022,71 @@ fn streamio(#[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str) {
     let mut b = [0; 15];
     assert_eq!(pipe.server.stream_recv(4, &mut b), Ok((12, true)));
     assert_eq!(&b[..12], b"hello, world");
+
+    assert!(pipe.server.stream_finished(4));
+}
+
+/// Test receiving into `BufMut`
+#[rstest]
+fn stream_recv_buf(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    use bytes::BufMut as _;
+
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    assert_eq!(pipe.client.stream_send(4, b"hello, world", true), Ok(12));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    assert!(!pipe.server.stream_finished(4));
+
+    let mut r = pipe.server.readable();
+    assert_eq!(r.next(), Some(4));
+    assert_eq!(r.next(), None);
+
+    let mut b = Vec::with_capacity(15).limit(15);
+    assert_eq!(b.get_ref().len(), 0);
+    assert_eq!(pipe.server.stream_recv_buf(4, &mut b), Ok((12, true)));
+    let b = b.into_inner();
+    assert_eq!(b.len(), 12);
+    assert_eq!(&b, b"hello, world");
+
+    assert!(pipe.server.stream_finished(4));
+}
+
+/// Test receiving into a BufMut. We test that a `Vec` used as `BufMut` will
+/// indeed grow automatically, and that `limit` is honored, and that we can
+/// adjust the limit, (and that we properly append once the limit is increased)
+#[rstest]
+fn stream_recv_buf_empty(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    use bytes::BufMut as _;
+
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    assert_eq!(pipe.client.stream_send(4, b"hello, world", true), Ok(12));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    assert!(!pipe.server.stream_finished(4));
+
+    let mut r = pipe.server.readable();
+    assert_eq!(r.next(), Some(4));
+    assert_eq!(r.next(), None);
+
+    let mut b = Vec::new().limit(2);
+    assert_eq!(b.get_ref().len(), 0);
+    assert_eq!(pipe.server.stream_recv_buf(4, &mut b), Ok((2, false)));
+    // The buffer won't accept additional writes
+    assert_eq!(pipe.server.stream_recv_buf(4, &mut b), Ok((0, false)));
+
+    b.set_limit(15);
+    assert_eq!(pipe.server.stream_recv_buf(4, &mut b), Ok((10, true)));
+    let b = b.into_inner();
+    assert_eq!(b.len(), 12);
+    assert_eq!(&b, b"hello, world");
 
     assert!(pipe.server.stream_finished(4));
 }
@@ -1416,11 +1516,21 @@ fn flow_control_limit_dup(
 fn flow_control_update(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
     #[values(true, false)] discard: bool,
+    #[values(true, false)] use_initial_max_data_as_flow_control_win: bool,
 ) {
     let mut buf = [0; 65535];
 
     let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
     assert_eq!(pipe.handshake(), Ok(()));
+    if use_initial_max_data_as_flow_control_win {
+        pipe.client
+            .enable_use_initial_max_data_as_flow_control_win();
+        pipe.server
+            .enable_use_initial_max_data_as_flow_control_win();
+    }
+
+    // Make sure the pipe is configured as we expect
+    assert_eq!(pipe.server.max_rx_data(), 30);
 
     let frames = [
         frame::Frame::Stream {
@@ -1465,7 +1575,13 @@ fn flow_control_update(
             max: 30
         })
     );
-    assert_eq!(iter.next(), Some(&frame::Frame::MaxData { max: 61 }));
+    if use_initial_max_data_as_flow_control_win {
+        // Initial max_data/window was 30, we consumed/read 16 bytes, which is
+        // more than 1/2 the window ==> new max data is 30 + 16
+        assert_eq!(iter.next(), Some(&frame::Frame::MaxData { max: 46 }));
+    } else {
+        assert_eq!(iter.next(), Some(&frame::Frame::MaxData { max: 61 }));
+    }
 }
 
 #[rstest]
@@ -2277,6 +2393,447 @@ fn streams_blocked_max_uni(
         pipe.send_pkt_to_server(pkt_type, &frames, &mut buf),
         Err(Error::InvalidFrame),
     );
+}
+
+#[rstest]
+fn streams_blocked_bidi_stat(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut buf = [0; 65535];
+
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    assert_eq!(pipe.server.streams_blocked_bidi_recv_count, 0);
+    assert_eq!(pipe.server.streams_blocked_uni_recv_count, 0);
+    assert_eq!(pipe.client.streams_blocked_bidi_recv_count, 0);
+    assert_eq!(pipe.client.streams_blocked_uni_recv_count, 0);
+
+    let frames = [frame::Frame::StreamsBlockedBidi {
+        limit: MAX_STREAM_ID,
+    }];
+
+    let pkt_type = Type::Short;
+    assert!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf).is_ok());
+
+    assert_eq!(pipe.server.streams_blocked_bidi_recv_count, 1);
+    assert_eq!(pipe.server.streams_blocked_uni_recv_count, 0);
+    assert_eq!(pipe.client.streams_blocked_bidi_recv_count, 0);
+    assert_eq!(pipe.client.streams_blocked_uni_recv_count, 0);
+
+    // Sending again increments further.
+    assert!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf).is_ok());
+
+    assert_eq!(pipe.server.streams_blocked_bidi_recv_count, 2);
+    assert_eq!(pipe.server.streams_blocked_uni_recv_count, 0);
+}
+
+#[rstest]
+fn streams_blocked_uni_stat(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut buf = [0; 65535];
+
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    assert_eq!(pipe.server.streams_blocked_bidi_recv_count, 0);
+    assert_eq!(pipe.server.streams_blocked_uni_recv_count, 0);
+    assert_eq!(pipe.client.streams_blocked_bidi_recv_count, 0);
+    assert_eq!(pipe.client.streams_blocked_uni_recv_count, 0);
+
+    let frames = [frame::Frame::StreamsBlockedUni {
+        limit: MAX_STREAM_ID,
+    }];
+
+    let pkt_type = Type::Short;
+    assert!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf).is_ok());
+
+    assert_eq!(pipe.server.streams_blocked_bidi_recv_count, 0);
+    assert_eq!(pipe.server.streams_blocked_uni_recv_count, 1);
+    assert_eq!(pipe.client.streams_blocked_bidi_recv_count, 0);
+    assert_eq!(pipe.client.streams_blocked_uni_recv_count, 0);
+
+    // Sending again increments further.
+    assert!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf).is_ok());
+
+    assert_eq!(pipe.server.streams_blocked_bidi_recv_count, 0);
+    assert_eq!(pipe.server.streams_blocked_uni_recv_count, 2);
+}
+
+/// Tests that a STREAMS_BLOCKED (bidi) frame is sent when the client tries to
+/// open a new bidirectional stream beyond the server's max_streams_bidi limit,
+/// that duplicate frames for the same limit are suppressed, and that a fresh
+/// frame is sent once the peer raises the limit and the endpoint becomes
+/// blocked again at the new, higher limit.
+#[rstest]
+fn streams_blocked_bidi_sent(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+    #[values(false, true)] enable_send_streams_blocked: bool,
+) {
+    let mut config = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
+    config.set_enable_send_streams_blocked(enable_send_streams_blocked);
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // The default config sets initial_max_streams_bidi = 3 for the server,
+    // so the client may open streams 0, 4, 8 (sequence 0, 1, 2).
+    // Trying to open stream 12 (sequence 3) must be rejected.
+    assert_eq!(pipe.client.stream_send(0, b"a", false), Ok(1));
+    assert_eq!(pipe.client.stream_send(4, b"a", false), Ok(1));
+    assert_eq!(pipe.client.stream_send(8, b"a", false), Ok(1));
+
+    // Attempting to open the 4th bidi stream should return StreamLimit and
+    // trigger a STREAMS_BLOCKED frame.
+    assert_eq!(
+        pipe.client.stream_send(12, b"a", false),
+        Err(Error::StreamLimit)
+    );
+
+    // Before advancing, the blocked state should be set but no frame sent yet.
+    if enable_send_streams_blocked {
+        assert!(pipe
+            .client
+            .streams_blocked_bidi_state
+            .has_pending_stream_blocked_frame());
+    } else {
+        assert!(!pipe
+            .client
+            .streams_blocked_bidi_state
+            .has_pending_stream_blocked_frame());
+    }
+
+    // Advance so the client flushes its pending frames to the server.
+    assert_eq!(pipe.advance(), Ok(()));
+
+    if enable_send_streams_blocked {
+        // The client should have sent one STREAMS_BLOCKED (bidi) frame.
+        assert!(!pipe
+            .client
+            .streams_blocked_bidi_state
+            .has_pending_stream_blocked_frame());
+
+        // The server must have received our STREAMS_BLOCKED (bidi) frame.
+        assert_eq!(pipe.server.streams_blocked_bidi_recv_count, 1);
+    } else {
+        // Frames not sent when feature disabled.
+        assert_eq!(pipe.server.streams_blocked_bidi_recv_count, 0);
+    }
+
+    // A second attempt at the same stream must NOT produce another frame —
+    // the peer has already been notified about this limit.
+    assert_eq!(
+        pipe.client.stream_send(12, b"a", false),
+        Err(Error::StreamLimit)
+    );
+    if enable_send_streams_blocked {
+        assert_eq!(pipe.advance(), Ok(()));
+        assert!(!pipe
+            .client
+            .streams_blocked_bidi_state
+            .has_pending_stream_blocked_frame());
+    }
+
+    // Simulate the peer raising the bidi stream limit to 4. The client can
+    // now open stream 12 (sequence 3) but will be blocked at stream 16
+    // (sequence 4 > new limit of 4). That is a new limit, so a fresh
+    // STREAMS_BLOCKED frame must be armed and subsequently sent.
+    pipe.client.streams.update_peer_max_streams_bidi(4);
+    assert_eq!(pipe.client.stream_send(12, b"a", false), Ok(1));
+    assert_eq!(
+        pipe.client.stream_send(16, b"a", false),
+        Err(Error::StreamLimit)
+    );
+
+    if enable_send_streams_blocked {
+        // The blocked flag must be set for the new limit.
+        assert!(pipe
+            .client
+            .streams_blocked_bidi_state
+            .has_pending_stream_blocked_frame());
+    }
+
+    // Emit the client's outgoing flight and process it at the server.
+    let flight = test_utils::emit_flight(&mut pipe.client);
+    assert!(flight.is_ok());
+    assert_eq!(
+        test_utils::process_flight(&mut pipe.server, flight.unwrap()),
+        Err(Error::StreamLimit)
+    );
+    if enable_send_streams_blocked {
+        assert_eq!(pipe.server.streams_blocked_bidi_recv_count, 2);
+        assert!(!pipe
+            .client
+            .streams_blocked_bidi_state
+            .has_pending_stream_blocked_frame());
+    } else {
+        assert_eq!(pipe.server.streams_blocked_bidi_recv_count, 0);
+    }
+}
+
+/// Tests that a STREAMS_BLOCKED (uni) frame is sent when the client tries to
+/// open a new unidirectional stream beyond the server's max_streams_uni limit,
+/// that duplicate frames for the same limit are suppressed, and that a fresh
+/// frame is sent once the peer raises the limit and the endpoint becomes
+/// blocked again at the new, higher limit.
+#[rstest]
+fn streams_blocked_uni_sent(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+    #[values(false, true)] enable_send_streams_blocked: bool,
+) {
+    let mut config = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
+    config.set_enable_send_streams_blocked(enable_send_streams_blocked);
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // The default config sets initial_max_streams_uni = 3 for the server,
+    // so the client may open streams 2, 6, 10 (sequence 0, 1, 2).
+    // Trying to open stream 14 (sequence 3) must be rejected.
+    assert_eq!(pipe.client.stream_send(2, b"a", false), Ok(1));
+    assert_eq!(pipe.client.stream_send(6, b"a", false), Ok(1));
+    assert_eq!(pipe.client.stream_send(10, b"a", false), Ok(1));
+
+    // Attempting to open the 4th uni stream should return StreamLimit and
+    // trigger a STREAMS_BLOCKED frame.
+    assert_eq!(
+        pipe.client.stream_send(14, b"a", false),
+        Err(Error::StreamLimit)
+    );
+
+    // Before advancing, the blocked state should be set but no frame sent yet.
+    if enable_send_streams_blocked {
+        assert!(pipe
+            .client
+            .streams_blocked_uni_state
+            .has_pending_stream_blocked_frame());
+    } else {
+        assert!(!pipe
+            .client
+            .streams_blocked_uni_state
+            .has_pending_stream_blocked_frame());
+    }
+
+    // Advance so the client flushes its pending frames to the server.
+    assert_eq!(pipe.advance(), Ok(()));
+
+    // The client should have sent one STREAMS_BLOCKED (uni) frame.
+    if enable_send_streams_blocked {
+        assert!(!pipe
+            .client
+            .streams_blocked_uni_state
+            .has_pending_stream_blocked_frame());
+
+        // The server must have received our STREAMS_BLOCKED (uni) frame.
+        assert_eq!(pipe.server.streams_blocked_uni_recv_count, 1);
+    } else {
+        // Frame not sent when feature disabled.
+        assert_eq!(pipe.server.streams_blocked_uni_recv_count, 0);
+    }
+
+    // A second attempt at the same stream must NOT produce another frame —
+    // the peer has already been notified about this limit.
+    assert_eq!(
+        pipe.client.stream_send(14, b"a", false),
+        Err(Error::StreamLimit)
+    );
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(
+        pipe.server.streams_blocked_uni_recv_count,
+        if enable_send_streams_blocked { 1 } else { 0 }
+    );
+
+    // Simulate the peer raising the uni stream limit to 4. The client can
+    // now open stream 14 (sequence 3) but will be blocked at stream 18
+    // (sequence 4 > new limit of 4). That is a new limit, so a fresh
+    // STREAMS_BLOCKED frame must be armed and subsequently sent.
+    pipe.client.streams.update_peer_max_streams_uni(4);
+    assert_eq!(pipe.client.stream_send(14, b"a", false), Ok(1));
+    assert_eq!(
+        pipe.client.stream_send(18, b"a", false),
+        Err(Error::StreamLimit)
+    );
+    if enable_send_streams_blocked {
+        // The blocked flag must be set for the new limit.
+        assert!(pipe
+            .client
+            .streams_blocked_uni_state
+            .has_pending_stream_blocked_frame());
+    }
+    // Emit the client's outgoing flight and process it at the server.
+    let flight = test_utils::emit_flight(&mut pipe.client);
+    assert!(flight.is_ok());
+    assert_eq!(
+        test_utils::process_flight(&mut pipe.server, flight.unwrap()),
+        Err(Error::StreamLimit)
+    );
+    if enable_send_streams_blocked {
+        assert_eq!(pipe.server.streams_blocked_uni_recv_count, 2);
+        assert!(!pipe
+            .client
+            .streams_blocked_uni_state
+            .has_pending_stream_blocked_frame());
+    } else {
+        assert_eq!(pipe.server.streams_blocked_uni_recv_count, 0);
+    }
+}
+
+/// Tests that a lost STREAMS_BLOCKED (bidi) frame is retransmitted.
+///
+/// When the packet carrying the frame is declared lost via the PTO mechanism,
+/// `streams_blocked_bidi_state` must be notified so that the same limit can
+/// be sent again.  The server must ultimately receive the frame.
+#[rstest]
+fn streams_blocked_bidi_retransmit(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut buf = [0; 65535];
+
+    let mut config = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
+    config.set_enable_send_streams_blocked(true);
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // Exhaust the server's initial bidi stream limit (3) so the next attempt
+    // returns StreamLimit and arms a STREAMS_BLOCKED frame.
+    assert_eq!(pipe.client.stream_send(0, b"a", false), Ok(1));
+    assert_eq!(pipe.client.stream_send(4, b"a", false), Ok(1));
+    assert_eq!(pipe.client.stream_send(8, b"a", false), Ok(1));
+    assert_eq!(
+        pipe.client.stream_send(12, b"a", false),
+        Err(Error::StreamLimit)
+    );
+
+    // Frame is armed but not yet sent.
+    assert!(pipe
+        .client
+        .streams_blocked_bidi_state
+        .has_pending_stream_blocked_frame());
+
+    // Emit the client's flight (stream data + STREAMS_BLOCKED) without
+    // delivering it to the server — the packet is "lost" from the server's
+    // perspective.
+    assert!(test_utils::emit_flight(&mut pipe.client).is_ok());
+
+    // After emission streams_blocked_bidi_state is updated and the sent counter
+    // advances.
+    assert!(!pipe
+        .client
+        .streams_blocked_bidi_state
+        .has_pending_stream_blocked_frame());
+
+    // The server has not received anything yet.
+    assert_eq!(pipe.server.streams_blocked_bidi_recv_count, 0);
+
+    // Trigger loss detection
+    test_utils::trigger_ack_based_loss(&mut pipe.client, &mut pipe.server);
+
+    // Trigger the lost-frames processing by calling send().  The loss handler
+    // is invoked at the start of each send_on_path() call to process any frames
+    // added to lost_frames by ack-based loss detection.
+    let (len, send_info) = pipe.client.send(&mut buf).unwrap();
+
+    // After the retransmit send the sequence is:
+    //   1. loss handler: clears `streams_blocked_bidi_state.blocked_sent` to
+    //      trigger retransmission
+    //   2. emit path:    sees
+    //      `streams_blocked_bidi_state.has_pending_stream_blocked_frame()`, emits
+    //      frame, increments sent_count → 2
+    assert!(!pipe
+        .client
+        .streams_blocked_bidi_state
+        .has_pending_stream_blocked_frame());
+
+    // The server has not received anything yet.
+    assert_eq!(pipe.server.streams_blocked_bidi_recv_count, 0);
+
+    // The PTO probe carries the retransmitted STREAMS_BLOCKED frame.
+    // Deliver it to the server.
+    let server_path = &pipe.server.paths.get_active().unwrap();
+    let info = RecvInfo {
+        to: server_path.local_addr(),
+        from: server_path.peer_addr(),
+    };
+    pipe.server.recv(&mut buf[..len], info).unwrap();
+
+    // The server must have received the retransmitted STREAMS_BLOCKED frame.
+    assert_eq!(pipe.server.streams_blocked_bidi_recv_count, 1);
+    let _ = send_info;
+}
+
+/// Tests that a lost STREAMS_BLOCKED (uni) frame is retransmitted.
+///
+/// When the packet carrying the frame is declared lost via the PTO mechanism,
+/// `streams_blocked_bidi_state` must be notified so that the same limit can
+/// be sent again.  The server must ultimately receive the frame.
+#[rstest]
+fn streams_blocked_uni_retransmit(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut buf = [0; 65535];
+
+    let mut config = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
+    config.set_enable_send_streams_blocked(true);
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // Exhaust the server's initial uni stream limit (3) so the next attempt
+    // returns StreamLimit and arms a STREAMS_BLOCKED frame.
+    assert_eq!(pipe.client.stream_send(2, b"a", false), Ok(1));
+    assert_eq!(pipe.client.stream_send(6, b"a", false), Ok(1));
+    assert_eq!(pipe.client.stream_send(10, b"a", false), Ok(1));
+    assert_eq!(
+        pipe.client.stream_send(14, b"a", false),
+        Err(Error::StreamLimit)
+    );
+
+    // Frame is armed but not yet sent.
+    assert!(pipe
+        .client
+        .streams_blocked_uni_state
+        .has_pending_stream_blocked_frame());
+
+    // Emit the client's flight (stream data + STREAMS_BLOCKED) without
+    // delivering it to the server — the packet is "lost" from the server's
+    // perspective.
+    assert!(test_utils::emit_flight(&mut pipe.client).is_ok());
+
+    // After emission the pending slot is cleared and the sent counter advances.
+    assert!(!pipe
+        .client
+        .streams_blocked_uni_state
+        .has_pending_stream_blocked_frame());
+
+    // The server has not received anything yet.
+    assert_eq!(pipe.server.streams_blocked_uni_recv_count, 0);
+
+    // Trigger loss detection
+    test_utils::trigger_ack_based_loss(&mut pipe.client, &mut pipe.server);
+
+    // Trigger the lost-frames processing by calling send().  The loss handler
+    // is invoked at the start of each send_on_path() call to process any frames
+    // added to lost_frames by ack-based loss detection.
+    let (len, send_info) = pipe.client.send(&mut buf).unwrap();
+
+    assert!(!pipe
+        .client
+        .streams_blocked_uni_state
+        .has_pending_stream_blocked_frame());
+
+    // The server has not received anything yet.
+    assert_eq!(pipe.server.streams_blocked_uni_recv_count, 0);
+
+    // Deliver the PTO probe (which carries the retransmitted STREAMS_BLOCKED
+    // frame) to the server.
+    let server_path = &pipe.server.paths.get_active().unwrap();
+    let info = RecvInfo {
+        to: server_path.local_addr(),
+        from: server_path.peer_addr(),
+    };
+    pipe.server.recv(&mut buf[..len], info).unwrap();
+
+    // The server must have received the retransmitted STREAMS_BLOCKED frame.
+    assert_eq!(pipe.server.streams_blocked_uni_recv_count, 1);
+    let _ = send_info;
 }
 
 #[rstest]
@@ -3291,9 +3848,13 @@ fn stream_shutdown_read_after_fin(
 
     let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
     assert_eq!(pipe.handshake(), Ok(()));
+    pipe.server
+        .enable_use_initial_max_data_as_flow_control_win();
+    pipe.client
+        .enable_use_initial_max_data_as_flow_control_win();
 
     // Client sends some data and a FIN.
-    assert_eq!(pipe.client.stream_send(4, b"hello, world", true), Ok(12));
+    assert_eq!(pipe.client.stream_send(4, b"hello, world123", true), Ok(15));
     assert_eq!(pipe.advance(), Ok(()));
 
     let mut r = pipe.server.readable();
@@ -3309,17 +3870,9 @@ fn stream_shutdown_read_after_fin(
     let mut r = pipe.server.readable();
     assert_eq!(r.next(), None);
 
-    // Server sends a flow control update, but it does NOT send
-    // STOP_SENDING frame, since it has already received a FIN from
-    // the client.
-    let (len, _) = pipe.server.send(&mut buf).unwrap();
-    let mut dummy = buf[..len].to_vec();
-    let frames =
-        test_utils::decode_pkt(&mut pipe.client, &mut dummy[..len]).unwrap();
-    for f in frames {
-        assert!(!matches!(f, frame::Frame::StopSending { .. }));
-    }
-    assert_eq!(pipe.client_recv(&mut buf[..len]), Ok(len));
+    // Server does NOT send STOP_SENDING frame, since it has already received a
+    // FIN from the client.
+    assert_eq!(pipe.server.send(&mut buf), Err(Error::Done));
 
     assert_eq!(pipe.advance(), Ok(()));
 
@@ -3375,6 +3928,10 @@ fn stream_shutdown_read_update_max_data(
     config.verify_peer(false);
 
     let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.server
+        .enable_use_initial_max_data_as_flow_control_win();
+    pipe.client
+        .enable_use_initial_max_data_as_flow_control_win();
     assert_eq!(pipe.handshake(), Ok(()));
 
     assert_eq!(pipe.client.stream_send(0, b"a", false), Ok(1));
@@ -3424,14 +3981,14 @@ fn stream_shutdown_read_update_max_data(
 
     // The client has dropped the 9 unset bytes in its buffer
     assert_eq!(pipe.client.tx_data, 21);
+    // The 21 consumed bytes have been added on the client
+    assert_eq!(pipe.client.max_tx_data, 30 + 21);
+    // ... and the client can send again
+    assert_eq!(pipe.client.stream_send(4, &[0], false), Ok(1));
+
+    // Server side is unchanged
     assert_eq!(pipe.server.rx_data, 21);
     assert_eq!(pipe.server.flow_control.consumed(), 21);
-    // default window is 1.5 * initial_max_data, so 45
-    assert_eq!(
-        pipe.client.tx_cap,
-        pipe.server.flow_control.window() as usize
-    );
-    assert_eq!(pipe.client.tx_cap, 45);
 
     assert_eq!(
         pipe.client.stream_send(0, b"hello, world", false),
@@ -3440,8 +3997,9 @@ fn stream_shutdown_read_update_max_data(
 
     // fully advance pipe
     assert_eq!(pipe.advance(), Ok(()));
-    assert_eq!(pipe.client.tx_data, 21);
-    assert_eq!(pipe.server.rx_data, 21);
+
+    assert_eq!(pipe.client.tx_data, 22);
+    assert_eq!(pipe.server.rx_data, 22);
     assert!(!pipe.server.stream_readable(0)); // nothing can be consumed
 
     // Server sends fin to fully close the stream.
@@ -3462,6 +4020,7 @@ fn stream_shutdown_read_update_max_data(
 fn stream_shutdown_write_update_max_data(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
     #[values(true, false)] discard: bool,
+    #[values(true, false)] use_initial_max_data_as_flow_control_win: bool,
 ) {
     let mut config = Config::new(PROTOCOL_VERSION).unwrap();
     assert_eq!(config.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
@@ -3482,6 +4041,12 @@ fn stream_shutdown_write_update_max_data(
 
     let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
     assert_eq!(pipe.handshake(), Ok(()));
+    if use_initial_max_data_as_flow_control_win {
+        pipe.server
+            .enable_use_initial_max_data_as_flow_control_win();
+        pipe.server
+            .enable_use_initial_max_data_as_flow_control_win();
+    }
 
     assert_eq!(pipe.client.stream_send(0, b"a", false), Ok(1));
     assert_eq!(pipe.advance(), Ok(()));
@@ -3513,8 +4078,16 @@ fn stream_shutdown_write_update_max_data(
     assert_eq!(pipe.server.rx_data, 30);
     assert_eq!(pipe.server.flow_control.consumed(), 30);
     assert_eq!(pipe.client.tx_data, 30);
-    // default window is 1.5 * initial_max_data, so 45
-    assert_eq!(pipe.client.tx_cap, 45);
+    // new max_tx_data is window + consumed
+    if use_initial_max_data_as_flow_control_win {
+        // initial window == initial_max_data == 30; consumed == 30
+        // ==> new max_tx_data is 60
+        assert_eq!(pipe.client.max_tx_data, 60);
+    } else {
+        // initial window == initial_max_data*1.5 == 45; consumed == 30
+        // ==> new max_tx_data is 75
+        assert_eq!(pipe.client.max_tx_data, 75);
+    }
 
     // client can send again on a different stream
     assert_eq!(pipe.client.stream_send(4, b"a", false), Ok(1));
@@ -4148,7 +4721,7 @@ fn invalid_initial_payload(
     // Use correct payload length when encrypting the packet.
     let payload_len = frames.iter().fold(0, |acc, x| acc + x.wire_len());
 
-    let aead = crypto_ctx.crypto_seal.as_ref().unwrap();
+    let aead = crypto_ctx.crypto_seal.as_mut().unwrap();
 
     let written = packet::encrypt_pkt(
         &mut b,
@@ -8012,6 +8585,50 @@ fn is_readable(
     assert!(!pipe.client.is_readable());
 }
 
+/// Tests that the dgram_lost stat is incremented when a DATAGRAM frame is
+/// declared lost.
+#[rstest]
+fn dgram_lost_stat(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut buf = [0; 65535];
+
+    let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+    assert_eq!(config.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
+    config
+        .load_cert_chain_from_pem_file("examples/cert.crt")
+        .unwrap();
+    config
+        .load_priv_key_from_pem_file("examples/cert.key")
+        .unwrap();
+    config
+        .set_application_protos(&[b"proto1", b"proto2"])
+        .unwrap();
+    config.enable_dgram(true, 10, 10);
+    config.verify_peer(false);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // Verify initial state: no datagrams lost.
+    assert_eq!(pipe.client.path_stats().next().unwrap().dgram_lost, 0);
+
+    // Client sends a datagram.
+    assert_eq!(pipe.client.dgram_send(b"hello, world"), Ok(()));
+
+    // Emit the datagram packet but don't deliver it to the server.
+    assert!(test_utils::emit_flight(&mut pipe.client).is_ok());
+
+    // Trigger loss detection.
+    test_utils::trigger_ack_based_loss(&mut pipe.client, &mut pipe.server);
+
+    // Trigger the lost-frames processing by calling send().
+    pipe.client.send(&mut buf).unwrap();
+
+    // Verify dgram_lost stat is incremented.
+    assert_eq!(pipe.client.path_stats().next().unwrap().dgram_lost, 1);
+}
+
 #[rstest]
 fn close(#[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str) {
     let mut buf = [0; 65535];
@@ -8835,6 +9452,173 @@ fn max_streams_threshold_after_handshake_callback_update(
     assert!(
         streams_left > CALLBACK_INITIAL_MAX_STREAMS_BIDI / 2 + 1,
         "MAX_STREAMS was not sent when available hit the correct threshold (50)"
+    );
+}
+
+#[test]
+fn enable_use_initial_max_data_as_flow_control_win() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config
+        .set_application_protos(&[b"proto1", b"proto2"])
+        .unwrap();
+    config.set_initial_max_data(1_000_000);
+    config.set_initial_max_stream_data_bidi_remote(500_000);
+    config.set_initial_max_stream_data_bidi_local(500_000);
+    config.set_initial_max_streams_bidi(10);
+    config.verify_peer(false);
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    pipe.server
+        .enable_use_initial_max_data_as_flow_control_win();
+
+    // We overrode the server's window and set it to initial_max_data
+    assert_eq!(pipe.server.flow_control.window(), 1_000_000);
+    // the clients window is set to DEFAULT_CONNECTION_WINDOW
+    assert_eq!(pipe.client.flow_control.window(), DEFAULT_CONNECTION_WINDOW);
+
+    // Create a new stream
+    pipe.client.stream_send(0, &[1, 2, 3], false).unwrap();
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(
+        pipe.client
+            .get_or_create_stream(0, true)
+            .unwrap()
+            .recv
+            .flow_control_for_tests()
+            .window(),
+        stream::DEFAULT_STREAM_WINDOW
+    );
+    assert_eq!(
+        pipe.server
+            .get_or_create_stream(0, false)
+            .unwrap()
+            .recv
+            .flow_control_for_tests()
+            .window(),
+        500_000
+    );
+}
+
+#[test]
+fn enable_use_initial_max_data_as_flow_control_win_in_config() {
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
+    for config in [&mut client_config, &mut server_config] {
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.set_initial_max_data(1_000_000);
+        config.set_initial_max_stream_data_bidi_remote(500_000);
+        config.set_initial_max_stream_data_bidi_local(500_000);
+        config.set_initial_max_streams_bidi(10);
+        config.verify_peer(false);
+    }
+    server_config.set_use_initial_max_data_as_flow_control_win(true);
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut server_config,
+    )
+    .unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    pipe.server
+        .enable_use_initial_max_data_as_flow_control_win();
+
+    // We overrode the window and set it to initial_max_data
+    assert_eq!(pipe.server.flow_control.window(), 1_000_000);
+    // the clients window is set to DEFAULT_CONNECTION_WINDOW
+    assert_eq!(pipe.client.flow_control.window(), DEFAULT_CONNECTION_WINDOW);
+
+    // Create a new stream
+    pipe.client.stream_send(0, &[1, 2, 3], false).unwrap();
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(
+        pipe.client
+            .get_or_create_stream(0, true)
+            .unwrap()
+            .recv
+            .flow_control_for_tests()
+            .window(),
+        stream::DEFAULT_STREAM_WINDOW
+    );
+    assert_eq!(
+        pipe.server
+            .get_or_create_stream(0, false)
+            .unwrap()
+            .recv
+            .flow_control_for_tests()
+            .window(),
+        500_000
+    );
+}
+
+/// Tests that `set_use_initial_max_data_as_flow_control_win_in_handshake()`
+/// correctly updates flow control windows.
+#[cfg(feature = "boringssl-boring-crate")]
+#[test]
+fn set_use_initial_max_data_as_flow_control_win_in_handshake() {
+    // Setup server with handshake callback
+    let mut server_tls_ctx_builder = test_utils::Pipe::default_tls_ctx_builder();
+    server_tls_ctx_builder.set_select_certificate_callback(|mut hello| {
+        // Change initial_max_streams_bidi from 4 to 100 during handshake
+        <Connection>::set_use_initial_max_data_as_flow_control_win_in_handshake(
+            hello.ssl_mut(),
+        )
+        .unwrap();
+
+        Ok(())
+    });
+
+    let mut server_config = Config::with_boring_ssl_ctx_builder(
+        PROTOCOL_VERSION,
+        server_tls_ctx_builder,
+    )
+    .unwrap();
+
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+
+    for config in [&mut client_config, &mut server_config] {
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.set_initial_max_data(1_000_000);
+        config.set_initial_max_stream_data_bidi_remote(500_000);
+        config.set_initial_max_stream_data_bidi_local(500_000);
+        config.set_initial_max_streams_bidi(10);
+        config.verify_peer(false);
+    }
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut server_config,
+    )
+    .unwrap();
+
+    assert_eq!(pipe.handshake(), Ok(()));
+    // We overrode the server's window and set it to initial_max_data
+    assert_eq!(pipe.server.flow_control.window(), 1_000_000);
+    // the clients window is set to DEFAULT_CONNECTION_WINDOW
+    assert_eq!(pipe.client.flow_control.window(), DEFAULT_CONNECTION_WINDOW);
+
+    // Create a new stream
+    pipe.client.stream_send(0, &[1, 2, 3], false).unwrap();
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(
+        pipe.client
+            .get_or_create_stream(0, true)
+            .unwrap()
+            .recv
+            .flow_control_for_tests()
+            .window(),
+        stream::DEFAULT_STREAM_WINDOW
+    );
+    assert_eq!(
+        pipe.server
+            .get_or_create_stream(0, false)
+            .unwrap()
+            .recv
+            .flow_control_for_tests()
+            .window(),
+        500_000
     );
 }
 
@@ -11072,7 +11856,7 @@ fn challenge_no_cids(
         frame.to_bytes(&mut b).expect("encode frames");
     }
 
-    let aead = crypto_ctx.crypto_seal.as_ref().expect("crypto seal");
+    let aead = crypto_ctx.crypto_seal.as_mut().expect("crypto seal");
 
     let written = packet::encrypt_pkt(
         &mut b,
@@ -12044,4 +12828,57 @@ fn connect_custom_client_dcid_too_short() {
         &mut client_config,
     );
     assert_eq!(client.err().unwrap(), Error::InvalidDcidInitialization);
+}
+
+#[cfg(feature = "qlog")]
+#[test]
+fn server_qlog() {
+    use qlog::reader::QlogSeqReader;
+
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+
+    pipe.server.set_qlog(
+        Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+        "test qlog".to_string(),
+        "test qlog description".to_string(),
+    );
+
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    pipe.server.qlog_streamer().unwrap().finish_log().unwrap();
+
+    let raw = pipe.server.qlog_streamer().unwrap().writer();
+    #[allow(clippy::borrowed_box)]
+    let w: &Box<std::io::Cursor<Vec<u8>>> = unsafe { std::mem::transmute(raw) };
+    let bytes = w.get_ref().clone();
+
+    let mut reader = QlogSeqReader::new(Box::new(std::io::BufReader::new(
+        std::io::Cursor::new(bytes),
+    )))
+    .unwrap();
+
+    // Header is parsed by QlogSeqReader::new into reader.qlog.
+    let header = reader.qlog.clone();
+    assert_eq!(header.title.as_deref(), Some("test qlog"));
+    assert_eq!(header.description.as_deref(), Some("test qlog description"));
+    assert_eq!(
+        header.trace.vantage_point.unwrap().ty,
+        qlog::VantagePointType::Server
+    );
+    let ref_time = header.trace.common_fields.unwrap().reference_time;
+    assert_eq!(ref_time.clock_type, "monotonic");
+    assert_eq!(ref_time.epoch, "unknown");
+    assert!(ref_time.wall_clock_time.is_some());
+
+    // First event yielded by the iterator is TransportParametersSet.
+    let first = reader.next().unwrap();
+    if let qlog::reader::Event::Qlog(event) = first {
+        if let EventData::QuicParametersSet(params) = event.data {
+            assert_eq!(params.initiator, Some(TransportInitiator::Local));
+        } else {
+            panic!("expected QuicParametersSet event");
+        }
+    } else {
+        panic!("expected Qlog event");
+    }
 }

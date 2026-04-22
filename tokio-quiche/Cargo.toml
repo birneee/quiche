@@ -1,6 +1,6 @@
 [package]
 name = "tokio-quiche"
-version = "0.16.0"
+version = "0.18.0"
 description = "Asynchronous wrapper around quiche"
 repository = { workspace = true }
 edition = { workspace = true }
@@ -25,8 +25,14 @@ rpk = ["boring/rpk"]
 # Replaces quiche's original congestion control
 # implementation with one adapted from google/quiche.
 gcongestion = ["quiche/gcongestion"]
-# Use quiche with zero-copy send calls.
+# Deprecated: zero-copy sends are now always enabled when using tokio-quiche.
+# This feature is kept for backwards compatibility and only enables `gcongestion`.
 zero-copy = ["gcongestion"]
+# Allow client connections to provide a custom DCID when initiating a
+# connection. Be aware that RFC 9000 places requirements for unpredictability and
+# length on the client DCID field. Enabling this feature can be dangerous if these
+# requirements are not satisfied.
+custom-client-dcid = ["quiche/custom-client-dcid"]
 
 # Deprecated: use `--cfg capture_keylogs` instead.
 capture_keylogs = []
@@ -41,7 +47,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(capture_keylogs)'] }
 [dependencies]
 anyhow = { workspace = true }
 boring = { workspace = true }
-buffer-pool = { workspace = true }
+bytes = { workspace = true }
 crossbeam = { workspace = true, default-features = false }
 datagram-socket = { workspace = true }
 foundations = { workspace = true, default-features = false, features = [
@@ -70,7 +76,6 @@ tokio-util = { workspace = true, features = [
   "io",
   "rt",
 ] }
-triomphe = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]

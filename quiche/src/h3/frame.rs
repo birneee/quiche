@@ -27,7 +27,7 @@
 use super::Result;
 
 #[cfg(feature = "qlog")]
-use qlog::events::h3::Http3Frame;
+use qlog::events::http3::Http3Frame;
 
 pub const DATA_FRAME_TYPE_ID: u64 = 0x0;
 pub const HEADERS_FRAME_TYPE_ID: u64 = 0x1;
@@ -345,10 +345,15 @@ impl Frame {
             // Qlog expects the `headers` to be represented as an array of
             // name:value pairs. At this stage, we only have the qpack block, so
             // populate the field with an empty vec.
-            Frame::Headers { .. } => Http3Frame::Headers { headers: vec![] },
+            Frame::Headers { .. } => Http3Frame::Headers {
+                headers: vec![],
+                raw: None,
+            },
 
-            Frame::CancelPush { push_id } =>
-                Http3Frame::CancelPush { push_id: *push_id },
+            Frame::CancelPush { push_id } => Http3Frame::CancelPush {
+                push_id: *push_id,
+                raw: None,
+            },
 
             Frame::Settings {
                 max_field_section_size,
@@ -363,57 +368,69 @@ impl Frame {
                 let mut settings = vec![];
 
                 if let Some(v) = max_field_section_size {
-                    settings.push(qlog::events::h3::Setting {
-                        name: "MAX_FIELD_SECTION_SIZE".to_string(),
+                    settings.push(qlog::events::http3::Setting {
+                        name: Some("MAX_FIELD_SECTION_SIZE".to_string()),
+                        name_bytes: None,
                         value: *v,
                     });
                 }
 
                 if let Some(v) = qpack_max_table_capacity {
-                    settings.push(qlog::events::h3::Setting {
-                        name: "QPACK_MAX_TABLE_CAPACITY".to_string(),
+                    settings.push(qlog::events::http3::Setting {
+                        name: Some("QPACK_MAX_TABLE_CAPACITY".to_string()),
+                        name_bytes: None,
                         value: *v,
                     });
                 }
 
                 if let Some(v) = qpack_blocked_streams {
-                    settings.push(qlog::events::h3::Setting {
-                        name: "QPACK_BLOCKED_STREAMS".to_string(),
+                    settings.push(qlog::events::http3::Setting {
+                        name: Some("QPACK_BLOCKED_STREAMS".to_string()),
+                        name_bytes: None,
                         value: *v,
                     });
                 }
 
                 if let Some(v) = connect_protocol_enabled {
-                    settings.push(qlog::events::h3::Setting {
-                        name: "SETTINGS_ENABLE_CONNECT_PROTOCOL".to_string(),
+                    settings.push(qlog::events::http3::Setting {
+                        name: Some(
+                            "SETTINGS_ENABLE_CONNECT_PROTOCOL".to_string(),
+                        ),
+                        name_bytes: None,
                         value: *v,
                     });
                 }
 
                 if let Some(v) = h3_datagram {
-                    settings.push(qlog::events::h3::Setting {
-                        name: "H3_DATAGRAM".to_string(),
+                    settings.push(qlog::events::http3::Setting {
+                        name: Some("H3_DATAGRAM".to_string()),
+                        name_bytes: None,
                         value: *v,
                     });
                 }
 
                 if let Some((k, v)) = grease {
-                    settings.push(qlog::events::h3::Setting {
-                        name: k.to_string(),
+                    settings.push(qlog::events::http3::Setting {
+                        name: Some(k.to_string()),
+                        name_bytes: None,
                         value: *v,
                     });
                 }
 
                 if let Some(additional_settings) = additional_settings {
                     for (k, v) in additional_settings {
-                        settings.push(qlog::events::h3::Setting {
-                            name: k.to_string(),
+                        settings.push(qlog::events::http3::Setting {
+                            name: Some(k.to_string()),
+                            name_bytes: None,
                             value: *v,
                         });
                     }
                 }
 
-                Http3Frame::Settings { settings }
+                Http3Frame::Settings {
+                    settings,
+                    raw: None,
+                }
             },
 
             // Qlog expects the `headers` to be represented as an array of
@@ -422,41 +439,44 @@ impl Frame {
             Frame::PushPromise { push_id, .. } => Http3Frame::PushPromise {
                 push_id: *push_id,
                 headers: vec![],
+                raw: None,
             },
 
-            Frame::GoAway { id } => Http3Frame::Goaway { id: *id },
+            Frame::GoAway { id } => Http3Frame::Goaway { id: *id, raw: None },
 
-            Frame::MaxPushId { push_id } =>
-                Http3Frame::MaxPushId { push_id: *push_id },
+            Frame::MaxPushId { push_id } => Http3Frame::MaxPushId {
+                push_id: *push_id,
+                raw: None,
+            },
 
             Frame::PriorityUpdateRequest {
                 prioritized_element_id,
                 priority_field_value,
             } => Http3Frame::PriorityUpdate {
-                target_stream_type:
-                    qlog::events::h3::H3PriorityTargetStreamType::Request,
-                prioritized_element_id: *prioritized_element_id,
+                stream_id: Some(*prioritized_element_id),
+                push_id: None,
                 priority_field_value: String::from_utf8_lossy(
                     priority_field_value,
                 )
                 .into_owned(),
+                raw: None,
             },
 
             Frame::PriorityUpdatePush {
                 prioritized_element_id,
                 priority_field_value,
             } => Http3Frame::PriorityUpdate {
-                target_stream_type:
-                    qlog::events::h3::H3PriorityTargetStreamType::Request,
-                prioritized_element_id: *prioritized_element_id,
+                stream_id: None,
+                push_id: Some(*prioritized_element_id),
                 priority_field_value: String::from_utf8_lossy(
                     priority_field_value,
                 )
                 .into_owned(),
+                raw: None,
             },
 
             Frame::Unknown { raw_type, payload } => Http3Frame::Unknown {
-                frame_type_value: *raw_type,
+                frame_type_bytes: *raw_type,
                 raw: Some(RawInfo {
                     data: None,
                     payload_length: Some(payload.len() as u64),

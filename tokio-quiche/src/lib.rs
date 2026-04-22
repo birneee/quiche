@@ -24,6 +24,8 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+#![allow(clippy::collapsible_match)]
+
 //! Bridging the gap between [quiche] and [tokio].
 //!
 //! tokio-quiche connects [quiche::Connection]s and [quiche::h3::Connection]s to
@@ -79,7 +81,9 @@
 //!   [boring]).
 //! - `gcongestion`: Replace quiche's original congestion control implementation
 //!   with one adapted from google/quiche.
-//! - `zero-copy`: Use zero-copy sends with quiche (implies `gcongestion`).
+//! - `zero-copy`: Deprecated. Zero-copy sends are now always enabled. This
+//!   feature is kept for backwards compatibility and only enables
+//!   `gcongestion`.
 //! - `perf-quic-listener-metrics`: Extra telemetry for QUIC handshake
 //!   durations, including protocol overhead and network delays.
 //! - `tokio-task-metrics`: Scheduling & poll duration histograms for tokio
@@ -101,7 +105,6 @@ mod result;
 pub mod settings;
 pub mod socket;
 
-pub use buffer_pool;
 pub use datagram_socket;
 
 use foundations::telemetry::settings::LogVerbosity;

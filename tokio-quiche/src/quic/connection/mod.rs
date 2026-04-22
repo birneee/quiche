@@ -68,7 +68,6 @@ use super::io::worker::Running;
 use super::io::worker::RunningOrClosing;
 use super::io::worker::WriteState;
 use super::QuicheConnection;
-use crate::buf_factory::PooledBuf;
 use crate::metrics::Metrics;
 use crate::quic::io::worker::IoWorker;
 use crate::quic::io::worker::WriterConfig;
@@ -196,7 +195,7 @@ pub struct Incoming {
     /// Used for the `perf-quic-listener-metrics` feature.
     pub rx_time: Option<SystemTime>,
     /// The packet's contents.
-    pub buf: PooledBuf,
+    pub buf: Vec<u8>,
     /// If set, then `buf` is a GRO buffer containing multiple packets.
     /// Each individual packet has a size of `gso` (except for the last one).
     pub gro: Option<i32>,
@@ -701,6 +700,10 @@ pub trait ApplicationOverQuic: Send + 'static {
     /// As for any future, it is **very important** that this method does not
     /// block the runtime. If it does, the other concurrent futures will be
     /// starved.
+    ///
+    /// # Cancel safety
+    /// This method MUST be cancel safe.
+    /// It gets called inside select! and could be (repeatedly) cancelled
     ///
     /// # Errors
     /// Returning an error from this method immediately stops the worker loop

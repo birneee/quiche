@@ -43,7 +43,6 @@ use quiche::WireErrorCode;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
-use tokio_quiche::buf_factory::BufFactory;
 use tokio_quiche::http3::driver::H3Event;
 use tokio_quiche::http3::driver::IncomingH3Headers;
 use tokio_quiche::http3::driver::OutboundFrame;
@@ -67,7 +66,7 @@ async fn handle_0_rtt_request() {
     let context_clone = context.clone();
     let mut quic_settings = QuicSettings::default();
     quic_settings.enable_early_data = true;
-    let url = start_server_with_settings(
+    let (url, _) = start_server_with_settings(
         quic_settings,
         Http3Settings::default(),
         TestConnectionHook::new(),
@@ -220,12 +219,9 @@ fn helper_server_handler(
                     .await
                     .unwrap();
 
-                    send.send(OutboundFrame::Body(
-                        BufFactory::get_empty_buf(),
-                        true,
-                    ))
-                    .await
-                    .unwrap();
+                    send.send(OutboundFrame::Body(Default::default(), true))
+                        .await
+                        .unwrap();
                 },
             }
         }

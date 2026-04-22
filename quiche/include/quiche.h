@@ -249,6 +249,10 @@ void quiche_config_enable_hystart(quiche_config *config, bool v);
 // Configures whether to enable pacing (enabled by default).
 void quiche_config_enable_pacing(quiche_config *config, bool v);
 
+// Configures whether to enable the CUBIC idle restart fix (enabled by default).
+void quiche_config_set_enable_cubic_idle_restart_fix(quiche_config *config,
+                                                     bool v);
+
 // Configures max pacing rate to be used.
 void quiche_config_set_max_pacing_rate(quiche_config *config, uint64_t v);
 
@@ -626,6 +630,16 @@ typedef struct {
 
     // The number of STREAM_DATA_BLOCKED frames received from the remote.
     uint64_t stream_data_blocked_recv_count;
+
+    // The number of STREAMS_BLOCKED frames for bidirectional streams received
+    // from the remote, indicating the peer is blocked on opening new
+    // bidirectional streams.
+    uint64_t streams_blocked_bidi_recv_count;
+
+    // The number of STREAMS_BLOCKED frames for unidirectional streams received
+    // from the remote, indicating the peer is blocked on opening new
+    // unidirectional streams.
+    uint64_t streams_blocked_uni_recv_count;
 
     // The total number of PATH_CHALLENGE frames that were received.
     uint64_t path_challenge_rx_count;

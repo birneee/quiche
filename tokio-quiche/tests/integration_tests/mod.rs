@@ -44,6 +44,7 @@ pub mod async_callbacks;
 pub mod connection_close;
 pub mod headers;
 pub mod migration;
+pub mod stream_limit;
 pub mod timeouts;
 pub mod zero_rtt;
 
@@ -52,7 +53,7 @@ async fn echo() {
     const CONN_COUNT: usize = 5;
 
     let req_count = |conn_num| conn_num * 100;
-    let (url, hook) = start_server();
+    let (url, hook, _) = start_server();
     let mut reqs = vec![];
 
     for i in 1..=CONN_COUNT {
@@ -77,7 +78,7 @@ async fn echo() {
 
 #[tokio::test]
 async fn e2e() {
-    let (url, hook) = start_server();
+    let (url, hook, _) = start_server();
     let url = format!("{url}/1");
 
     let res = request(url, 1).await.unwrap();
@@ -100,7 +101,7 @@ async fn e2e_client_ip_validation_disabled() {
 
     let hook = TestConnectionHook::new();
 
-    let url = start_server_with_settings(
+    let (url, _) = start_server_with_settings(
         quic_settings,
         Http3Settings::default(),
         hook.clone(),
@@ -126,7 +127,7 @@ async fn quiche_logs_forwarded_server_side(cx: TestTelemetryContext) {
 
     let hook = TestConnectionHook::new();
 
-    let url = start_server_with_settings(
+    let (url, _) = start_server_with_settings(
         quic_settings,
         Http3Settings::default(),
         hook,
@@ -203,54 +204,40 @@ async fn test_ioworker_state_machine_pause() {
 }
 
 #[tokio::test]
+#[cfg(feature = "custom-client-dcid")]
+async fn test_connect_with_custom_dcid() {
+    use tokio_quiche::http3::settings::Http3Settings;
+    use tokio_quiche::quic::connect_with_config;
+    use tokio_quiche::socket::Socket;
+    use tokio_quiche::ClientH3Driver;
+    use tokio_quiche::ConnectionIdGenerator;
+
+    let (url, _hook, _audit_stats_rx) = start_server();
+    let addr = extract_host_ipv4(&url);
+
+    let tokio_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    tokio_socket.connect(addr).await.unwrap();
+    let socket = Socket::try_from(tokio_socket).unwrap();
+    let (h3_driver, _h3_controller) =
+        ClientH3Driver::new(Http3Settings::default());
+    let dcid =
+        tokio_quiche::quic::SimpleConnectionIdGenerator.new_connection_id();
+    let mut params = ConnectionParams::default();
+    params.dcid = Some(dcid);
+
+    assert!(timeout(
+        Duration::from_secs(5),
+        connect_with_config(socket, Some("127.0.0.1"), &params, h3_driver,),
+    )
+    .await
+    .expect("connection timed out")
+    .is_ok());
+}
+
+#[tokio::test]
 #[cfg(target_os = "linux")]
-async fn test_so_mark_receieve_data() {
-    use datagram_socket::QuicAuditStats;
-    use std::sync::Arc;
-    use std::sync::RwLock;
-
-    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://127.0.0.1:{}", socket.local_addr().unwrap().port());
-
-    let tls_cert_settings = TlsCertificatePaths {
-        cert: TEST_CERT_FILE,
-        private_key: TEST_KEY_FILE,
-        kind: tokio_quiche::settings::CertificateKind::X509,
-    };
-
-    let hooks = Hooks {
-        connection_hook: Some(TestConnectionHook::new()),
-    };
-
-    let params = ConnectionParams::new_server(
-        QuicSettings::default(),
-        tls_cert_settings,
-        hooks,
-    );
-    let mut stream = listen(vec![socket], params, DefaultMetrics)
-        .unwrap()
-        .remove(0);
-
-    let audit_log: Arc<RwLock<Option<Arc<QuicAuditStats>>>> =
-        Arc::new(RwLock::new(None));
-    let clone = Arc::clone(&audit_log);
-
-    let _ = tokio::spawn(async move {
-        let (h3_driver, h3_controller) =
-            ServerH3Driver::new(Http3Settings::default());
-        let conn = stream.next().await.unwrap().unwrap();
-
-        let quic_connection = conn.start(h3_driver);
-        let h3_over_quic =
-            ServerH3Connection::new(quic_connection, h3_controller);
-
-        let audit_stats = Arc::clone(h3_over_quic.audit_log_stats());
-        *clone.write().unwrap() = Some(audit_stats);
-        let _ = tokio::spawn(async move {
-            handle_connection(h3_over_quic).await;
-        })
-        .await;
-    });
+async fn test_so_mark_receive_data() {
+    let (url, _, mut audit_stats_rx) = start_server();
 
     let url = format!("{url}/1");
     let summary = timeout(Duration::from_secs(2), h3i_fixtures::request(&url, 1))
@@ -260,8 +247,8 @@ async fn test_so_mark_receieve_data() {
 
     assert!(received_status_code_on_stream(&summary, 0, 200));
 
-    let audit_log = audit_log.read().unwrap();
-    let so_mark_data = audit_log.as_ref().unwrap().initial_so_mark_data();
+    let audit_stats = audit_stats_rx.recv().await.expect("should receive stats");
+    let so_mark_data = audit_stats.initial_so_mark_data();
     // We don't actually set SO_MARK anywhere, so we just want to ensure that the
     // data is `Some`, indicating that we at least received the cmsg from the
     // socket.

@@ -27,8 +27,6 @@
 //! Responsible for creating a [tokio_quiche::quic::QuicheConnection] and
 //! yielding I/O to tokio-quiche.
 
-use buffer_pool::ConsumeBuffer;
-use buffer_pool::Pooled;
 use log;
 use quiche::PathStats;
 use quiche::Stats;
@@ -135,6 +133,7 @@ fn create_config(args: &H3iConfig) -> QuicSettings {
     quic_settings.active_connection_id_limit = 0;
     quic_settings.max_connection_window = args.max_window;
     quic_settings.max_stream_window = args.max_stream_window;
+    quic_settings.enable_send_streams_blocked = true;
     quic_settings.grease = false;
 
     quic_settings.capture_quiche_logs = true;
@@ -223,7 +222,7 @@ impl Future for BuildingConnectionSummary {
 }
 
 pub struct H3iDriver {
-    buffer: Pooled<ConsumeBuffer>,
+    buffer: Vec<u8>,
     actions: Vec<Action>,
     actions_executed: usize,
     next_fire_time: Instant,
@@ -247,7 +246,7 @@ impl H3iDriver {
 
         (
             Self {
-                buffer: BufFactory::get_max_buf(),
+                buffer: vec![0u8; BufFactory::MAX_BUF_SIZE],
                 actions,
                 actions_executed: 0,
                 next_fire_time: Instant::now(),
@@ -284,6 +283,13 @@ impl H3iDriver {
                     },
                     WaitType::StreamEvent(event) => {
                         self.waiting_for_responses.add_wait(event);
+                    },
+                    WaitType::CanOpenNumStreams(required_streams) => {
+                        log::info!(
+                            "h3i: waiting for peer_streams_left_bidi >= {required_streams:?}"
+                        );
+                        self.waiting_for_responses
+                            .set_required_stream_quota(*required_streams);
                     },
                 }
             } else {
@@ -333,6 +339,8 @@ impl ApplicationOverQuic for H3iDriver {
         for event in stream_events {
             self.waiting_for_responses.remove_wait(event);
         }
+
+        self.waiting_for_responses.check_can_open_num_streams(qconn);
 
         Ok(())
     }

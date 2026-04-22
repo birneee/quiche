@@ -24,7 +24,7 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use crate::range_buf::BufFactory;
+use crate::buffers::BufFactory;
 
 use super::Error;
 use super::Result;
@@ -52,15 +52,15 @@ pub enum Type {
 
 impl Type {
     #[cfg(feature = "qlog")]
-    pub fn to_qlog(self) -> qlog::events::h3::H3StreamType {
+    pub fn to_qlog(self) -> qlog::events::http3::StreamType {
         match self {
-            Type::Control => qlog::events::h3::H3StreamType::Control,
-            Type::Request => qlog::events::h3::H3StreamType::Request,
-            Type::Push => qlog::events::h3::H3StreamType::Push,
-            Type::QpackEncoder => qlog::events::h3::H3StreamType::QpackEncode,
-            Type::QpackDecoder => qlog::events::h3::H3StreamType::QpackDecode,
-            Type::WebTransport => qlog::events::h3::H3StreamType::Unknown,
-            Type::Unknown => qlog::events::h3::H3StreamType::Unknown,
+            Type::Control => qlog::events::http3::StreamType::Control,
+            Type::Request => qlog::events::http3::StreamType::Request,
+            Type::Push => qlog::events::http3::StreamType::Push,
+            Type::QpackEncoder => qlog::events::http3::StreamType::QpackEncode,
+            Type::QpackDecoder => qlog::events::http3::StreamType::QpackDecode,
+            Type::WebTransport => qlog::events::http3::StreamType::Unknown,
+            Type::Unknown => qlog::events::http3::StreamType::Unknown,
         }
     }
 }
@@ -606,6 +606,7 @@ impl Stream {
     ///
     /// If successful, returns the `frame::Frame` and the payload length.
     pub fn try_consume_frame(&mut self) -> Result<(frame::Frame, u64)> {
+        debug_assert_eq!(self.state, State::FramePayload);
         // Processing a frame other than DATA, so re-arm the Data event.
         self.reset_data_event();
 
@@ -624,12 +625,13 @@ impl Stream {
     }
 
     /// Tries to read DATA payload from the transport stream.
-    pub fn try_consume_data<F: BufFactory>(
-        &mut self, conn: &mut crate::Connection<F>, out: &mut [u8],
+    pub fn try_consume_data<F: BufFactory, OUT: bytes::BufMut>(
+        &mut self, conn: &mut crate::Connection<F>, out: OUT,
     ) -> Result<(usize, bool)> {
-        let left = std::cmp::min(out.len(), self.state_len - self.state_off);
+        debug_assert_eq!(self.state, State::Data);
+        let out = out.limit(self.state_len - self.state_off);
 
-        let (len, fin) = match conn.stream_recv(self.id, &mut out[..left]) {
+        let (len, fin) = match conn.stream_recv_buf(self.id, out) {
             Ok(v) => v,
 
             Err(e) => {
@@ -643,6 +645,7 @@ impl Stream {
         };
 
         self.state_off += len;
+        debug_assert!(self.state_len >= self.state_off);
 
         // The stream is not readable anymore, so re-arm the Data event.
         if !conn.stream_readable(self.id) {

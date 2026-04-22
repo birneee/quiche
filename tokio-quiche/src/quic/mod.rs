@@ -125,11 +125,7 @@ pub use self::connection::SimpleConnectionIdGenerator;
 pub use self::hooks::ConnectionHook;
 
 /// Alias of [quiche::Connection] used internally by the crate.
-#[cfg(feature = "zero-copy")]
 pub type QuicheConnection = quiche::Connection<crate::buf_factory::BufFactory>;
-/// Alias of [quiche::Connection] used internally by the crate.
-#[cfg(not(feature = "zero-copy"))]
-pub type QuicheConnection = quiche::Connection;
 
 fn make_qlog_writer(
     dir: &str, id: &str,
@@ -200,7 +196,27 @@ where
     let mut client_config = Config::new(params, socket.capabilities)?;
     let scid = SimpleConnectionIdGenerator.new_connection_id();
 
-    #[cfg(feature = "zero-copy")]
+    #[cfg(feature = "custom-client-dcid")]
+    let mut quiche_conn = if let Some(dcid) = &params.dcid {
+        quiche::connect_with_dcid_and_buffer_factory(
+            host,
+            &scid,
+            dcid,
+            socket.local_addr,
+            socket.peer_addr,
+            client_config.as_mut(),
+        )?
+    } else {
+        quiche::connect_with_buffer_factory(
+            host,
+            &scid,
+            socket.local_addr,
+            socket.peer_addr,
+            client_config.as_mut(),
+        )?
+    };
+
+    #[cfg(not(feature = "custom-client-dcid"))]
     let mut quiche_conn = quiche::connect_with_buffer_factory(
         host,
         &scid,
@@ -209,15 +225,9 @@ where
         client_config.as_mut(),
     )?;
 
-    #[cfg(not(feature = "zero-copy"))]
-    let mut quiche_conn = quiche::connect(
-        host,
-        &scid,
-        socket.local_addr,
-        socket.peer_addr,
-        client_config.as_mut(),
-    )?;
-
+    #[cfg(feature = "custom-client-dcid")]
+    log::info!("created unestablished quiche::Connection"; "scid" => ?scid, "provided_dcid" => ?params.dcid);
+    #[cfg(not(feature = "custom-client-dcid"))]
     log::info!("created unestablished quiche::Connection"; "scid" => ?scid);
 
     if let Some(session) = &params.session {
