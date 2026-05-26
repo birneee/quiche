@@ -68,6 +68,7 @@ cdylib-link-lines = { version = "0.1", optional = true }
 
 [dependencies]
 bytes = { workspace = true }
+fast-list = "0.1"
 boring = { workspace = true, optional = true }
 debug_panic = { workspace = true }
 either = { version = "1.8", default-features = false }

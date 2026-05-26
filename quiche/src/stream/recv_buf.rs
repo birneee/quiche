@@ -26,14 +26,16 @@
 
 use std::cmp;
 
-use std::collections::BTreeMap;
-use std::collections::VecDeque;
-
 use std::time::Duration;
 use std::time::Instant;
 
+use bytes::Bytes;
+use fast_list::LinkedList;
+use fast_list::LinkedListIndex;
+
 use crate::stream::RecvAction;
 use crate::stream::RecvBufResetReturn;
+use crate::stream::StreamIdHashMap;
 use crate::Error;
 use crate::Result;
 
@@ -41,19 +43,61 @@ use crate::flowcontrol;
 
 use crate::range_buf::RangeBuf;
 
+/// Identity-hashed map from stream offset → data chunk.
+type OffsetMap = StreamIdHashMap<Bytes>;
+
+/// A half-open byte interval `[start, end)`.
+#[derive(Debug, Clone, Copy)]
+struct ByteInterval {
+    start: u64,
+    end:   u64,
+}
+
+/// Ordered list of byte ranges not yet received (quic-go gap tracking).
+///
+/// Initialized with a single all-covering gap `[0, u64::MAX)` so that
+/// `#[derive(Default)]` on `RecvBuf` produces a ready-to-use instance.
+#[derive(Debug)]
+struct Gaps(LinkedList<ByteInterval>);
+
+impl Default for Gaps {
+    fn default() -> Self {
+        let mut list = LinkedList::new();
+        list.push_back(ByteInterval { start: 0, end: u64::MAX });
+        Gaps(list)
+    }
+}
+
+impl std::ops::Deref for Gaps {
+    type Target = LinkedList<ByteInterval>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Gaps {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 /// Receive-side stream buffer.
 ///
-/// Stream data received by the peer is buffered in a list of data chunks
-/// ordered by offset in ascending order. Contiguous data can then be read
-/// into a slice.
+/// Incoming stream frames are stored in `data`, an offset-keyed hash map
+/// (ported from quic-go's frameSorter). A `gaps` list tracks which byte
+/// ranges are still missing. `off` is the next offset to deliver to the
+/// application — it doubles as the sorter's read position, so no separate
+/// struct or sync helpers are needed.
 #[derive(Debug, Default)]
 pub struct RecvBuf {
-    /// Chunks of data received from the peer that have not yet been read by
-    /// the application, ordered by offset.
-    data: BTreeMap<u64, RangeBuf>,
+    /// Buffered chunks keyed by start offset.
+    data: OffsetMap,
 
     /// The lowest data offset that has yet to be read by the application.
     off: u64,
+
+    /// Ordered list of byte ranges not yet received (quic-go gap tracking).
+    gaps: Gaps,
 
     /// The total length of data received on this stream.
     len: u64,
@@ -126,73 +170,20 @@ impl RecvBuf {
             return Ok(());
         }
 
-        // Check if data is fully duplicate, that is the buffer's max offset is
-        // lower or equal to the offset already stored in the recv buffer.
-        if self.off >= buf.max_off() {
-            // An exception is applied to empty range buffers, because an empty
-            // buffer's max offset matches the max offset of the recv buffer.
-            //
-            // By this point all spurious empty buffers should have already been
-            // discarded, so allowing empty buffers here should be safe.
+        self.len = cmp::max(self.len, buf.max_off());
+
+        if !self.drain {
             if !buf.is_empty() {
-                return Ok(());
+                self.sorter_push(buf.off(), Bytes::copy_from_slice(&buf[..]))?;
+            } else if buf.fin() && !self.ready() {
+                // Empty fin with no data at the read position: insert a
+                // zero-length sentinel so the application gets one
+                // Ok((0, true)) notification.
+                self.data.insert(self.off, Bytes::new());
             }
-        }
-
-        let mut tmp_bufs = VecDeque::with_capacity(2);
-        tmp_bufs.push_back(buf);
-
-        'tmp: while let Some(mut buf) = tmp_bufs.pop_front() {
-            // Discard incoming data below current stream offset. Bytes up to
-            // `self.off` have already been received so we should not buffer
-            // them again. This is also important to make sure `ready()` doesn't
-            // get stuck when a buffer with lower offset than the stream's is
-            // buffered.
-            if self.off_front() > buf.off() {
-                buf = buf.split_off((self.off_front() - buf.off()) as usize);
-            }
-
-            // Handle overlapping data. If the incoming data's starting offset
-            // is above the previous maximum received offset, there is clearly
-            // no overlap so this logic can be skipped. However do still try to
-            // merge an empty final buffer (i.e. an empty buffer with the fin
-            // flag set, which is the only kind of empty buffer that should
-            // reach this point).
-            if buf.off() < self.max_off() || buf.is_empty() {
-                for (_, b) in self.data.range(buf.off()..) {
-                    let off = buf.off();
-
-                    // We are past the current buffer.
-                    if b.off() > buf.max_off() {
-                        break;
-                    }
-
-                    // New buffer is fully contained in existing buffer.
-                    if off >= b.off() && buf.max_off() <= b.max_off() {
-                        continue 'tmp;
-                    }
-
-                    // New buffer's start overlaps existing buffer.
-                    if off >= b.off() && off < b.max_off() {
-                        buf = buf.split_off((b.max_off() - off) as usize);
-                    }
-
-                    // New buffer's end overlaps existing buffer.
-                    if off < b.off() && buf.max_off() > b.off() {
-                        tmp_bufs
-                            .push_back(buf.split_off((b.off() - off) as usize));
-                    }
-                }
-            }
-
-            self.len = cmp::max(self.len, buf.max_off());
-
-            if !self.drain {
-                self.data.insert(buf.max_off(), buf);
-            } else {
-                // we are not storing any data, off == len
-                self.off = self.len;
-            }
+        } else {
+            // we are not storing any data, off == len
+            self.off = self.len;
         }
 
         Ok(())
@@ -248,14 +239,8 @@ impl RecvBuf {
         }
 
         while cap > 0 && self.ready() {
-            let mut entry = match self.data.first_entry() {
-                Some(entry) => entry,
-                None => break,
-            };
-
-            let buf = entry.get_mut();
-
-            let buf_len = cmp::min(buf.len(), cap);
+            let chunk = self.sorter_pop(cap)?;
+            let chunk_len = chunk.len();
 
             // Only copy data if we're emitting, not discarding.
             if let RecvAction::Emit { ref mut out } = action {
@@ -267,22 +252,11 @@ impl RecvBuf {
                     cap <= out.remaining_mut(),
                     "We updated `cap` incorrectly"
                 );
-                out.put_slice(&buf[..buf_len])
+                out.put_slice(&chunk[..]);
             }
 
-            self.off += buf_len as u64;
-
-            len += buf_len;
-            cap -= buf_len;
-
-            if buf_len < buf.len() {
-                buf.consume(buf_len);
-
-                // We reached the maximum capacity, so end here.
-                break;
-            }
-
-            entry.remove();
+            len += chunk_len;
+            cap -= chunk_len;
         }
 
         // Update consumed bytes for flow control.
@@ -307,6 +281,11 @@ impl RecvBuf {
             return Err(Error::FinalSize);
         }
 
+        // Final size must not exceed the stream-level flow control limit.
+        if final_size > self.max_data() {
+            return Err(Error::FlowControl);
+        }
+
         if self.error.is_some() {
             // We already verified that the final size matches
             return Ok(RecvBufResetReturn::zero());
@@ -325,11 +304,15 @@ impl RecvBuf {
         self.off = final_size;
 
         self.data.clear();
+        self.fin_off = Some(final_size);
+        self.len = cmp::max(self.len, final_size);
 
-        // In order to ensure the application is notified when the stream is
-        // reset, enqueue a zero-length buffer at the final size offset.
-        let buf = RangeBuf::from(b"", final_size, true);
-        self.write(buf)?;
+        // Insert a sentinel so ready() returns true and the application
+        // receives exactly one StreamReset notification via emit_or_discard.
+        // Skip if already draining — shutdown() means the app is done reading.
+        if !self.drain {
+            self.data.insert(self.off, Bytes::new());
+        }
 
         Ok(result)
     }
@@ -378,6 +361,8 @@ impl RecvBuf {
     }
 
     /// Returns the lowest offset of data buffered.
+    // Used by qlog (feature-gated); suppress the warning when qlog is disabled.
+    #[allow(dead_code)]
     pub fn off_front(&self) -> u64 {
         self.off
     }
@@ -411,17 +396,199 @@ impl RecvBuf {
 
     /// Returns true if the stream has data to be read.
     pub fn ready(&self) -> bool {
-        let (_, buf) = match self.data.first_key_value() {
-            Some(v) => v,
-            None => return false,
-        };
-
-        buf.off() == self.off
+        self.data.contains_key(&self.off)
     }
 
     #[cfg(test)]
     pub(crate) fn flow_control_for_tests(&self) -> &flowcontrol::FlowControl {
         &self.flow_control
+    }
+
+    // -----------------------------------------------------------------------
+    // Frame-sorter internals (ported from quic-go's frameSorter)
+    // -----------------------------------------------------------------------
+
+    /// Remove and return up to `max_size` bytes starting at `self.off`.
+    fn sorter_pop(&mut self, max_size: usize) -> Result<Bytes> {
+        let mut chunk = match self.data.remove(&self.off) {
+            Some(b) => b,
+            None => return Err(Error::Done),
+        };
+        if max_size < chunk.len() {
+            let out = chunk.split_to(max_size);
+            self.off += max_size as u64;
+            self.data.insert(self.off, chunk);
+            Ok(out)
+        } else {
+            self.off += chunk.len() as u64;
+            Ok(chunk)
+        }
+    }
+
+    /// Insert a new frame, trimming or discarding bytes that overlap with
+    /// already-received data. Longer frames replace shorter ones at the same
+    /// position (quic-go semantics).
+    fn sorter_push(&mut self, offset: u64, mut buf: Bytes) -> Result<()> {
+        debug_assert!(!buf.is_empty());
+        debug_assert!(self.gaps.head().is_some());
+
+        let mut start = offset;
+        let mut end = offset + buf.len() as u64;
+
+        if end <= self.gaps.head().unwrap().value.start {
+            return Ok(());
+        }
+
+        let (start_gap, starts_in_gap) = self.find_start_gap(start);
+        let (end_gap, ends_in_gap) = self.find_end_gap(start_gap, end);
+
+        let start_gap_equals_end_gap = start_gap == end_gap;
+
+        // Read all fields we need from the two gap nodes upfront — one lookup
+        // each, matching quic-go's single pointer-dereference per element.
+        let sg = self.gaps.get(start_gap).unwrap();
+        let start_gap_next  = sg.next_index;
+        let start_gap_start = sg.value.start;
+        let start_gap_end   = sg.value.end;
+        let (end_gap_start, end_gap_end) = if start_gap_equals_end_gap {
+            (start_gap_start, start_gap_end)
+        } else {
+            let eg = self.gaps.get(end_gap).unwrap().value;
+            (eg.start, eg.end)
+        };
+
+        if (start_gap_equals_end_gap && end <= start_gap_start) ||
+            (!start_gap_equals_end_gap &&
+                start_gap_end >= end_gap_start &&
+                end <= start_gap_start)
+        {
+            return Ok(()); // duplicate
+        }
+
+        let mut adjusted_start_gap_end = false;
+
+        let mut pos = start;
+        let mut has_replaced_at_least_one = false;
+
+        // Replace shorter existing frames with this longer one.
+        while let Some(old) = self.data.remove(&pos) {
+            let old_len = old.len() as u64;
+            if end - pos > old_len ||
+                (has_replaced_at_least_one && end - pos == old_len)
+            {
+                pos += old_len;
+                has_replaced_at_least_one = true;
+            } else {
+                if !has_replaced_at_least_one {
+                    return Ok(());
+                }
+                // Cut new frame so it ends where the existing frame starts.
+                let _ = buf.split_off((pos - start) as usize);
+                end = pos;
+                break;
+            }
+        }
+
+        // Trim leading bytes that fall before the gap start.
+        if !starts_in_gap && !has_replaced_at_least_one {
+            buf = buf.split_off((start_gap_start - start) as usize);
+            start = start_gap_start;
+        }
+
+        // Update / remove the start gap.
+        if start <= start_gap_start {
+            if end >= start_gap_end {
+                self.gaps.remove(start_gap);
+            } else {
+                self.gaps.get_mut(start_gap).unwrap().value.start = end;
+            }
+        } else if !has_replaced_at_least_one {
+            self.gaps.get_mut(start_gap).unwrap().value.end = start;
+            adjusted_start_gap_end = true;
+        }
+
+        // Remove intermediate gaps and their associated frames.
+        if !start_gap_equals_end_gap {
+            self.delete_consecutive(start_gap_end);
+            let mut gap = start_gap_next;
+            while let Some(idx) = gap {
+                let item = self.gaps.get(idx).unwrap();
+                if item.value.end >= end_gap_start {
+                    break;
+                }
+                let item_end = item.value.end;
+                let next = item.next_index;
+                self.delete_consecutive(item_end);
+                self.gaps.remove(idx);
+                gap = next;
+            }
+        }
+
+        // Trim trailing bytes that fall past the end gap.
+        if !ends_in_gap && start != end_gap_end && end > end_gap_end {
+            let _ = buf.split_off((end_gap_end - start) as usize);
+            end = end_gap_end;
+        }
+
+        // Update / remove the end gap.
+        if end == end_gap_end {
+            if !start_gap_equals_end_gap {
+                self.gaps.remove(end_gap);
+            }
+        } else if start_gap_equals_end_gap && adjusted_start_gap_end {
+            self.gaps.insert_after(
+                start_gap,
+                ByteInterval { start: end, end: start_gap_end },
+            );
+        } else if !start_gap_equals_end_gap {
+            self.gaps.get_mut(end_gap).unwrap().value.start = end;
+        }
+
+        const MAX_GAPS: usize = 1000;
+        if self.gaps.len() > MAX_GAPS {
+            panic!("too many gaps in received stream data");
+        }
+
+        self.data.insert(start, buf);
+        Ok(())
+    }
+
+    /// Returns the handle of the gap that contains or precedes `offset`, and
+    /// whether `offset` falls inside that gap.
+    fn find_start_gap(&self, offset: u64) -> (LinkedListIndex, bool) {
+        for item in self.gaps.iter() {
+            if offset >= item.value.start && offset <= item.value.end {
+                return (item.index, true);
+            }
+            if offset < item.value.start {
+                return (item.index, false);
+            }
+        }
+        panic!("no gap found for offset {offset}");
+    }
+
+    /// Returns the handle of the gap that contains or follows `offset`, and
+    /// whether `offset` falls inside that gap.
+    fn find_end_gap(
+        &self, start_gap: LinkedListIndex, offset: u64,
+    ) -> (LinkedListIndex, bool) {
+        let mut prev = start_gap;
+        for item in self.gaps.iter_next(start_gap) {
+            if offset >= item.value.start && offset < item.value.end {
+                return (item.index, true);
+            }
+            if offset < item.value.start {
+                return (prev, false);
+            }
+            prev = item.index;
+        }
+        panic!("no gap found for offset {offset}");
+    }
+
+    fn delete_consecutive(&mut self, mut pos: u64) {
+        while let Some(entry) = self.data.remove(&pos) {
+            pos += entry.len() as u64;
+        }
     }
 }
 
@@ -866,9 +1033,9 @@ mod tests {
         assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 2);
+        assert_eq!(recv.data.len(), 1); // sorter: longer "something" replaces shorter "hello"
 
-        assert_emit_discard(&mut recv, emit, 32, 9, false, Some(b"somehello"));
+        assert_emit_discard(&mut recv, emit, 32, 9, false, Some(b"something"));
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 9);
         assert_eq!(recv.data.len(), 0);
@@ -893,9 +1060,9 @@ mod tests {
         assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 3);
+        assert_eq!(recv.data.len(), 1); // sorter: longer "something" replaces shorter "hello"
 
-        assert_emit_discard(&mut recv, emit, 32, 9, false, Some(b"somhellog"));
+        assert_emit_discard(&mut recv, emit, 32, 9, false, Some(b"something"));
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 9);
         assert_eq!(recv.data.len(), 0);
@@ -926,7 +1093,7 @@ mod tests {
         assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 18);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 5);
+        assert_eq!(recv.data.len(), 1); // sorter: longer "somethingsomething" replaces both "hello" frames
 
         assert_emit_discard(
             &mut recv,
@@ -934,7 +1101,7 @@ mod tests {
             32,
             18,
             false,
-            Some(b"somhellogsomhellog"),
+            Some(b"somethingsomething"),
         );
         assert_eq!(recv.len, 18);
         assert_eq!(recv.off, 18);
@@ -1032,7 +1199,7 @@ mod tests {
         assert!(recv.write(fourth).is_ok());
         assert_eq!(recv.len, 10);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 6);
+        assert_eq!(recv.data.len(), 1); // sorter: longer "helloworld" replaces "he", "ow", "rl"
 
         assert_emit_discard(&mut recv, emit, 32, 10, true, Some(b"helloworld"));
         assert_eq!(recv.len, 10);
@@ -1072,7 +1239,7 @@ mod tests {
         assert!(recv.write(fourth).is_ok());
         assert_eq!(recv.len, 16);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 5);
+        assert_eq!(recv.data.len(), 2); // sorter: "elloworldbarfoo" trims to "orldbarfoo"@6; "hellow"@0 stays
 
         assert_emit_discard(
             &mut recv,
