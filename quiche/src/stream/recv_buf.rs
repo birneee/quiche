@@ -29,7 +29,6 @@ use std::cmp;
 use std::time::Duration;
 use std::time::Instant;
 
-use bytes::Bytes;
 use fast_list::LinkedList;
 use fast_list::LinkedListIndex;
 
@@ -44,7 +43,7 @@ use crate::flowcontrol;
 use crate::range_buf::RangeBuf;
 
 /// Identity-hashed map from stream offset → data chunk.
-type OffsetMap = StreamIdHashMap<Bytes>;
+type OffsetMap = StreamIdHashMap<RangeBuf>;
 
 /// A half-open byte interval `[start, end)`.
 #[derive(Debug, Clone, Copy)]
@@ -86,8 +85,7 @@ impl std::ops::DerefMut for Gaps {
 /// Incoming stream frames are stored in `data`, an offset-keyed hash map
 /// (ported from quic-go's frameSorter). A `gaps` list tracks which byte
 /// ranges are still missing. `off` is the next offset to deliver to the
-/// application — it doubles as the sorter's read position, so no separate
-/// struct or sync helpers are needed.
+/// application.
 #[derive(Debug, Default)]
 pub struct RecvBuf {
     /// Buffered chunks keyed by start offset.
@@ -113,6 +111,13 @@ pub struct RecvBuf {
 
     /// Whether incoming data is validated but not buffered.
     drain: bool,
+
+    /// The frame currently being consumed by emit_or_discard.
+    ///
+    /// Partial reads advance the frame in-place via `RangeBuf::consume` —
+    /// no re-insertion into the map. Sentinels (empty-fin, reset) are stored
+    /// here directly, bypassing the map entirely.
+    current: Option<RangeBuf>,
 }
 
 impl RecvBuf {
@@ -174,12 +179,12 @@ impl RecvBuf {
 
         if !self.drain {
             if !buf.is_empty() {
-                self.sorter_push(buf.off(), Bytes::copy_from_slice(&buf[..]))?;
+                self.sorter_push(buf)?;
             } else if buf.fin() && !self.ready() {
-                // Empty fin with no data at the read position: insert a
-                // zero-length sentinel so the application gets one
-                // Ok((0, true)) notification.
-                self.data.insert(self.off, Bytes::new());
+                // Empty fin with no data at the read position: store a
+                // zero-length sentinel as the current frame so the application
+                // gets one Ok((0, true)) notification. Bypasses the map.
+                self.current = Some(RangeBuf::default());
             }
         } else {
             // we are not storing any data, off == len
@@ -235,12 +240,19 @@ impl RecvBuf {
         // instead.
         if let Some(e) = self.error {
             self.data.clear();
+            self.current = None;
             return Err(Error::StreamReset(e));
         }
 
-        while cap > 0 && self.ready() {
-            let chunk = self.sorter_pop(cap)?;
-            let chunk_len = chunk.len();
+        while cap > 0 {
+            if self.current.is_none() {
+                self.current = self.data.remove(&self.off);
+                if self.current.is_none() {
+                    break;
+                }
+            }
+            let chunk = self.current.as_mut().unwrap();
+            let take = chunk.len().min(cap);
 
             // Only copy data if we're emitting, not discarding.
             if let RecvAction::Emit { ref mut out } = action {
@@ -252,11 +264,17 @@ impl RecvBuf {
                     cap <= out.remaining_mut(),
                     "We updated `cap` incorrectly"
                 );
-                out.put_slice(&chunk[..]);
+                out.put_slice(&chunk[..take]);
             }
 
-            len += chunk_len;
-            cap -= chunk_len;
+            chunk.consume(take);
+            self.off += take as u64;
+            len += take;
+            cap -= take;
+
+            if chunk.is_empty() {
+                self.current = None;
+            }
         }
 
         // Update consumed bytes for flow control.
@@ -307,11 +325,11 @@ impl RecvBuf {
         self.fin_off = Some(final_size);
         self.len = cmp::max(self.len, final_size);
 
-        // Insert a sentinel so ready() returns true and the application
-        // receives exactly one StreamReset notification via emit_or_discard.
-        // Skip if already draining — shutdown() means the app is done reading.
+        // Store a sentinel as the current frame so the application receives
+        // exactly one StreamReset notification via emit_or_discard. Bypasses
+        // the map. Skip if already draining — shutdown() means the app is done.
         if !self.drain {
-            self.data.insert(self.off, Bytes::new());
+            self.current = Some(RangeBuf::default());
         }
 
         Ok(result)
@@ -352,6 +370,7 @@ impl RecvBuf {
 
         self.drain = true;
 
+        self.current = None;
         self.data.clear();
 
         let consumed = self.max_off() - self.off;
@@ -395,8 +414,10 @@ impl RecvBuf {
     }
 
     /// Returns true if the stream has data to be read.
+    #[inline]
     pub fn ready(&self) -> bool {
-        self.data.contains_key(&self.off)
+        self.current.is_some()
+            || self.off < self.gaps.head().unwrap().value.start
     }
 
     #[cfg(test)]
@@ -404,36 +425,16 @@ impl RecvBuf {
         &self.flow_control
     }
 
-    // -----------------------------------------------------------------------
-    // Frame-sorter internals (ported from quic-go's frameSorter)
-    // -----------------------------------------------------------------------
-
-    /// Remove and return up to `max_size` bytes starting at `self.off`.
-    fn sorter_pop(&mut self, max_size: usize) -> Result<Bytes> {
-        let mut chunk = match self.data.remove(&self.off) {
-            Some(b) => b,
-            None => return Err(Error::Done),
-        };
-        if max_size < chunk.len() {
-            let out = chunk.split_to(max_size);
-            self.off += max_size as u64;
-            self.data.insert(self.off, chunk);
-            Ok(out)
-        } else {
-            self.off += chunk.len() as u64;
-            Ok(chunk)
-        }
-    }
 
     /// Insert a new frame, trimming or discarding bytes that overlap with
     /// already-received data. Longer frames replace shorter ones at the same
-    /// position (quic-go semantics).
-    fn sorter_push(&mut self, offset: u64, mut buf: Bytes) -> Result<()> {
+    /// position.
+    fn sorter_push(&mut self, mut buf: RangeBuf) -> Result<()> {
         debug_assert!(!buf.is_empty());
         debug_assert!(self.gaps.head().is_some());
 
-        let mut start = offset;
-        let mut end = offset + buf.len() as u64;
+        let mut start = buf.off();
+        let mut end = start + buf.len() as u64;
 
         if end <= self.gaps.head().unwrap().value.start {
             return Ok(());
@@ -444,8 +445,7 @@ impl RecvBuf {
 
         let start_gap_equals_end_gap = start_gap == end_gap;
 
-        // Read all fields we need from the two gap nodes upfront — one lookup
-        // each, matching quic-go's single pointer-dereference per element.
+        // Read all gap fields upfront before any mutations.
         let sg = self.gaps.get(start_gap).unwrap();
         let start_gap_next  = sg.next_index;
         let start_gap_start = sg.value.start;
@@ -693,21 +693,24 @@ mod tests {
         assert!(recv.write(buf).is_ok());
         assert_eq!(recv.len, 5);
         assert_eq!(recv.off, 5);
-        assert_eq!(recv.data.len(), 1);
+        assert!(recv.current.is_some());
+        assert_eq!(recv.data.len(), 0);
 
         // Don't store additional fin empty buffers.
         let buf = RangeBuf::from(b"", 5, true);
         assert!(recv.write(buf).is_ok());
         assert_eq!(recv.len, 5);
         assert_eq!(recv.off, 5);
-        assert_eq!(recv.data.len(), 1);
+        assert!(recv.current.is_some());
+        assert_eq!(recv.data.len(), 0);
 
         // Don't store additional fin non-empty buffers.
         let buf = RangeBuf::from(b"aa", 3, true);
         assert!(recv.write(buf).is_ok());
         assert_eq!(recv.len, 5);
         assert_eq!(recv.off, 5);
-        assert_eq!(recv.data.len(), 1);
+        assert!(recv.current.is_some());
+        assert_eq!(recv.data.len(), 0);
 
         // Validate final size with fin empty buffers.
         let buf = RangeBuf::from(b"", 6, true);
