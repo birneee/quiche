@@ -24,13 +24,12 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::cmp;
-
-use std::collections::BTreeMap;
-use std::collections::VecDeque;
-
 use std::time::Duration;
 use std::time::Instant;
+
+use s2n_quic_reassembler::Error as ReassemblerError;
+use s2n_quic_reassembler::Reassembler;
+use s2n_quic_reassembler::VarInt;
 
 use crate::stream::RecvAction;
 use crate::stream::RecvBufResetReturn;
@@ -41,6 +40,14 @@ use crate::flowcontrol;
 
 use crate::range_buf::RangeBuf;
 
+fn map_reassembler_error(error: ReassemblerError) -> Error {
+    match error {
+        ReassemblerError::OutOfRange => Error::InvalidFrame,
+        ReassemblerError::InvalidFin => Error::FinalSize,
+        ReassemblerError::ReaderError(error) => match error {},
+    }
+}
+
 /// Receive-side stream buffer.
 ///
 /// Stream data received by the peer is buffered in a list of data chunks
@@ -48,9 +55,8 @@ use crate::range_buf::RangeBuf;
 /// into a slice.
 #[derive(Debug, Default)]
 pub struct RecvBuf {
-    /// Chunks of data received from the peer that have not yet been read by
-    /// the application, ordered by offset.
-    data: BTreeMap<u64, RangeBuf>,
+    /// Stream data received from the peer and reassembled by offset.
+    data: Reassembler,
 
     /// The lowest data offset that has yet to be read by the application.
     off: u64,
@@ -64,8 +70,14 @@ pub struct RecvBuf {
     /// The final stream offset received from the peer, if any.
     fin_off: Option<u64>,
 
+    /// Whether a zero-length fin needs to be reported to the application.
+    fin_pending: bool,
+
     /// The error code received via RESET_STREAM.
     error: Option<u64>,
+
+    /// Whether a reset needs to be reported to the application.
+    reset_pending: bool,
 
     /// Whether incoming data is validated but not buffered.
     drain: bool,
@@ -111,16 +123,6 @@ impl RecvBuf {
             return Err(Error::FinalSize);
         }
 
-        // We already saved the final offset, so there's nothing else we
-        // need to keep from the RangeBuf if it's empty.
-        if self.fin_off.is_some() && buf.is_empty() {
-            return Ok(());
-        }
-
-        if buf.fin() {
-            self.fin_off = Some(buf.max_off());
-        }
-
         // No need to store empty buffer that doesn't carry the fin flag.
         if !buf.fin() && buf.is_empty() {
             return Ok(());
@@ -128,7 +130,7 @@ impl RecvBuf {
 
         // Check if data is fully duplicate, that is the buffer's max offset is
         // lower or equal to the offset already stored in the recv buffer.
-        if self.off >= buf.max_off() {
+        if self.off_front() >= buf.max_off() {
             // An exception is applied to empty range buffers, because an empty
             // buffer's max offset matches the max offset of the recv buffer.
             //
@@ -139,60 +141,36 @@ impl RecvBuf {
             }
         }
 
-        let mut tmp_bufs = VecDeque::with_capacity(2);
-        tmp_bufs.push_back(buf);
+        // We already saved the final offset, so there's nothing else we
+        // need to keep from the RangeBuf if it's empty.
+        if self.fin_off.is_some() && buf.is_empty() {
+            return Ok(());
+        }
 
-        'tmp: while let Some(mut buf) = tmp_bufs.pop_front() {
-            // Discard incoming data below current stream offset. Bytes up to
-            // `self.off` have already been received so we should not buffer
-            // them again. This is also important to make sure `ready()` doesn't
-            // get stuck when a buffer with lower offset than the stream's is
-            // buffered.
-            if self.off_front() > buf.off() {
-                buf = buf.split_off((self.off_front() - buf.off()) as usize);
-            }
+        let max_off = buf.max_off();
 
-            // Handle overlapping data. If the incoming data's starting offset
-            // is above the previous maximum received offset, there is clearly
-            // no overlap so this logic can be skipped. However do still try to
-            // merge an empty final buffer (i.e. an empty buffer with the fin
-            // flag set, which is the only kind of empty buffer that should
-            // reach this point).
-            if buf.off() < self.max_off() || buf.is_empty() {
-                for (_, b) in self.data.range(buf.off()..) {
-                    let off = buf.off();
+        if !self.drain {
+            let offset =
+                VarInt::new(buf.off()).map_err(|_| Error::InvalidFrame)?;
+            VarInt::new(max_off).map_err(|_| Error::InvalidFrame)?;
 
-                    // We are past the current buffer.
-                    if b.off() > buf.max_off() {
-                        break;
-                    }
-
-                    // New buffer is fully contained in existing buffer.
-                    if off >= b.off() && buf.max_off() <= b.max_off() {
-                        continue 'tmp;
-                    }
-
-                    // New buffer's start overlaps existing buffer.
-                    if off >= b.off() && off < b.max_off() {
-                        buf = buf.split_off((b.max_off() - off) as usize);
-                    }
-
-                    // New buffer's end overlaps existing buffer.
-                    if off < b.off() && buf.max_off() > b.off() {
-                        tmp_bufs
-                            .push_back(buf.split_off((b.off() - off) as usize));
-                    }
-                }
-            }
-
-            self.len = cmp::max(self.len, buf.max_off());
-
-            if !self.drain {
-                self.data.insert(buf.max_off(), buf);
+            let result = if buf.fin() {
+                self.data.write_at_fin(offset, &buf)
             } else {
-                // we are not storing any data, off == len
-                self.off = self.len;
-            }
+                self.data.write_at(offset, &buf)
+            };
+
+            result.map_err(map_reassembler_error)?;
+        } else {
+            // We are not storing any data, off == len.
+            self.off = self.off.max(max_off);
+        }
+
+        self.len = self.len.max(max_off);
+
+        if buf.fin() {
+            self.fin_off = Some(max_off);
+            self.fin_pending |= max_off == self.off && buf.is_empty();
         }
 
         Ok(())
@@ -243,46 +221,50 @@ impl RecvBuf {
         // The stream was reset, so clear its data and return the error code
         // instead.
         if let Some(e) = self.error {
-            self.data.clear();
+            self.data.reset();
+            self.reset_pending = false;
             return Err(Error::StreamReset(e));
         }
 
-        while cap > 0 && self.ready() {
-            let mut entry = match self.data.first_entry() {
-                Some(entry) => entry,
-                None => break,
+        while cap > 0 {
+            let buf_len = match action {
+                RecvAction::Emit { ref mut out } => {
+                    let Some(buf) = self.data.pop_watermarked(cap) else {
+                        break;
+                    };
+
+                    let buf_len = buf.len();
+
+                    // Note: `BufMut::remaining_mut()` cannot "shrink", but
+                    // BufMut impls are allowed to grow the buffer, so we check
+                    // here that we still have at least `cap` bytes, but we
+                    // can't require equality.
+                    debug_assert!(
+                        cap <= out.remaining_mut(),
+                        "We updated `cap` incorrectly"
+                    );
+                    out.put_slice(&buf);
+
+                    buf_len
+                },
+
+                RecvAction::Discard { .. } => {
+                    let Some(buf_len) = self.data.pop_len_watermarked(cap) else {
+                        break;
+                    };
+
+                    buf_len
+                },
             };
-
-            let buf = entry.get_mut();
-
-            let buf_len = cmp::min(buf.len(), cap);
-
-            // Only copy data if we're emitting, not discarding.
-            if let RecvAction::Emit { ref mut out } = action {
-                // Note: `BufMut::remaining_mut()` cannot "shrink", but BufMut
-                // impls are allowed to grow the buffer, so we
-                // check here that we still have at least
-                // `cap` bytes, but we can't require equality
-                debug_assert!(
-                    cap <= out.remaining_mut(),
-                    "We updated `cap` incorrectly"
-                );
-                out.put_slice(&buf[..buf_len])
-            }
 
             self.off += buf_len as u64;
 
             len += buf_len;
             cap -= buf_len;
+        }
 
-            if buf_len < buf.len() {
-                buf.consume(buf_len);
-
-                // We reached the maximum capacity, so end here.
-                break;
-            }
-
-            entry.remove();
+        if len == 0 && cap > 0 && self.fin_pending {
+            self.fin_pending = false;
         }
 
         // Update consumed bytes for flow control.
@@ -307,6 +289,10 @@ impl RecvBuf {
             return Err(Error::FinalSize);
         }
 
+        if final_size > self.max_data() {
+            return Err(Error::FlowControl);
+        }
+
         if self.error.is_some() {
             // We already verified that the final size matches
             return Ok(RecvBufResetReturn::zero());
@@ -320,16 +306,14 @@ impl RecvBuf {
         };
 
         self.error = Some(error_code);
+        self.fin_off = Some(final_size);
+        self.fin_pending = false;
+        self.reset_pending = !self.drain;
 
         // Clear all data already buffered.
         self.off = final_size;
-
-        self.data.clear();
-
-        // In order to ensure the application is notified when the stream is
-        // reset, enqueue a zero-length buffer at the final size offset.
-        let buf = RangeBuf::from(b"", final_size, true);
-        self.write(buf)?;
+        self.len = final_size;
+        self.data.reset();
 
         Ok(result)
     }
@@ -369,7 +353,9 @@ impl RecvBuf {
 
         self.drain = true;
 
-        self.data.clear();
+        self.data.reset();
+        self.fin_pending = false;
+        self.reset_pending = false;
 
         let consumed = self.max_off() - self.off;
         self.off = self.max_off();
@@ -411,12 +397,7 @@ impl RecvBuf {
 
     /// Returns true if the stream has data to be read.
     pub fn ready(&self) -> bool {
-        let (_, buf) = match self.data.first_key_value() {
-            Some(v) => v,
-            None => return false,
-        };
-
-        buf.off() == self.off
+        self.reset_pending || !self.data.is_empty() || self.fin_pending
     }
 
     #[cfg(test)]
@@ -506,7 +487,6 @@ mod tests {
         assert!(recv.write(buf).is_ok());
         assert_eq!(recv.len, 5);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 1);
 
         assert_emit_discard(&mut recv, emit, 32, 5, false, None);
 
@@ -515,7 +495,6 @@ mod tests {
         assert!(recv.write(buf).is_ok());
         assert_eq!(recv.len, 5);
         assert_eq!(recv.off, 5);
-        assert_eq!(recv.data.len(), 0);
 
         // Check flow control for empty buffer.
         let buf = RangeBuf::from(b"", 16, false);
@@ -526,21 +505,18 @@ mod tests {
         assert!(recv.write(buf).is_ok());
         assert_eq!(recv.len, 5);
         assert_eq!(recv.off, 5);
-        assert_eq!(recv.data.len(), 1);
 
         // Don't store additional fin empty buffers.
         let buf = RangeBuf::from(b"", 5, true);
         assert!(recv.write(buf).is_ok());
         assert_eq!(recv.len, 5);
         assert_eq!(recv.off, 5);
-        assert_eq!(recv.data.len(), 1);
 
         // Don't store additional fin non-empty buffers.
         let buf = RangeBuf::from(b"aa", 3, true);
         assert!(recv.write(buf).is_ok());
         assert_eq!(recv.len, 5);
         assert_eq!(recv.off, 5);
-        assert_eq!(recv.data.len(), 1);
 
         // Validate final size with fin empty buffers.
         let buf = RangeBuf::from(b"", 6, true);
@@ -612,7 +588,6 @@ mod tests {
         assert_eq!(recv.shutdown(), Ok(10));
         assert_eq!(recv.len, 10);
         assert_eq!(recv.off, 10);
-        assert_eq!(recv.data.len(), 0);
 
         assert_emit_discard_done(&mut recv, emit);
 
@@ -620,14 +595,12 @@ mod tests {
         assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 10);
         assert_eq!(recv.off, 10);
-        assert_eq!(recv.data.len(), 0);
 
         // the max offset of received data can increase and
         // the recv.off must increase with it
         assert!(recv.write(third).is_ok());
         assert_eq!(recv.len, 19);
         assert_eq!(recv.off, 19);
-        assert_eq!(recv.data.len(), 0);
 
         // Send a reset
         assert_emit_discard_done(&mut recv, emit);
@@ -640,7 +613,6 @@ mod tests {
         );
         assert_eq!(recv.len, 123);
         assert_eq!(recv.off, 123);
-        assert_eq!(recv.data.len(), 0);
 
         assert_emit_discard_done(&mut recv, emit);
     }
@@ -775,12 +747,10 @@ mod tests {
         assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 1);
 
         assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 1);
 
         assert_emit_discard(&mut recv, emit, 32, 9, true, Some(b"something"));
         assert_eq!(recv.len, 9);
@@ -801,7 +771,6 @@ mod tests {
         assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 1);
 
         assert_emit_discard(&mut recv, emit, 32, 9, false, Some(b"something"));
         assert_eq!(recv.len, 9);
@@ -810,14 +779,12 @@ mod tests {
         assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 9);
-        assert_eq!(recv.data.len(), 0);
 
         assert_eq!(recv.write(third), Err(Error::FinalSize));
 
         assert!(recv.write(fourth).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 9);
-        assert_eq!(recv.data.len(), 0);
 
         assert_emit_discard_done(&mut recv, emit);
     }
@@ -834,17 +801,14 @@ mod tests {
         assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 1);
 
         assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 1);
 
         assert_emit_discard(&mut recv, emit, 32, 9, false, Some(b"something"));
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 9);
-        assert_eq!(recv.data.len(), 0);
 
         assert_emit_discard_done(&mut recv, emit);
     }
@@ -861,17 +825,14 @@ mod tests {
         assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 1);
 
         assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 2);
 
         assert_emit_discard(&mut recv, emit, 32, 9, false, Some(b"somehello"));
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 9);
-        assert_eq!(recv.data.len(), 0);
 
         assert_emit_discard_done(&mut recv, emit);
     }
@@ -888,17 +849,14 @@ mod tests {
         assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 8);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 1);
 
         assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 3);
 
         assert_emit_discard(&mut recv, emit, 32, 9, false, Some(b"somhellog"));
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 9);
-        assert_eq!(recv.data.len(), 0);
 
         assert_emit_discard_done(&mut recv, emit);
     }
@@ -916,17 +874,14 @@ mod tests {
         assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 8);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 1);
 
         assert!(recv.write(third).is_ok());
         assert_eq!(recv.len, 17);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 2);
 
         assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 18);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 5);
 
         assert_emit_discard(
             &mut recv,
@@ -938,7 +893,6 @@ mod tests {
         );
         assert_eq!(recv.len, 18);
         assert_eq!(recv.off, 18);
-        assert_eq!(recv.data.len(), 0);
 
         assert_emit_discard_done(&mut recv, emit);
     }
@@ -955,12 +909,10 @@ mod tests {
         assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 1);
 
         assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 13);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 2);
 
         assert_emit_discard(
             &mut recv,
@@ -989,12 +941,10 @@ mod tests {
         assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 12);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 1);
 
         assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 12);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 2);
 
         assert_emit_discard(&mut recv, emit, 32, 12, true, Some(b"helsomething"));
         assert_eq!(recv.len, 12);
@@ -1017,22 +967,18 @@ mod tests {
         assert!(recv.write(third).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 1);
 
         assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 2);
 
         assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 3);
 
         assert!(recv.write(fourth).is_ok());
         assert_eq!(recv.len, 10);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 6);
 
         assert_emit_discard(&mut recv, emit, 32, 10, true, Some(b"helloworld"));
         assert_eq!(recv.len, 10);
@@ -1057,22 +1003,18 @@ mod tests {
         assert!(recv.write(third).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 1);
 
         assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 16);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 2);
 
         assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 16);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 3);
 
         assert!(recv.write(fourth).is_ok());
         assert_eq!(recv.len, 16);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 5);
 
         assert_emit_discard(
             &mut recv,
@@ -1103,17 +1045,14 @@ mod tests {
         assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 13);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 1);
 
         assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 13);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 2);
 
         assert!(recv.write(third).is_ok());
         assert_eq!(recv.len, 15);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 3);
 
         assert_emit_discard(
             &mut recv,
@@ -1125,7 +1064,6 @@ mod tests {
         );
         assert_eq!(recv.len, 15);
         assert_eq!(recv.off, 15);
-        assert_eq!(recv.data.len(), 0);
 
         assert_emit_discard_done(&mut recv, emit);
     }
@@ -1148,32 +1086,26 @@ mod tests {
         assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 5);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 1);
 
         assert!(recv.write(fourth).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 2);
 
         assert!(recv.write(third).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 3);
 
         assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 4);
 
         assert!(recv.write(sixth).is_ok());
         assert_eq!(recv.len, 14);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 5);
 
         assert!(recv.write(fifth).is_ok());
         assert_eq!(recv.len, 14);
         assert_eq!(recv.off, 0);
-        assert_eq!(recv.data.len(), 6);
 
         assert_emit_discard(
             &mut recv,
@@ -1185,7 +1117,6 @@ mod tests {
         );
         assert_eq!(recv.len, 14);
         assert_eq!(recv.off, 14);
-        assert_eq!(recv.data.len(), 0);
 
         assert_emit_discard_done(&mut recv, emit);
     }
