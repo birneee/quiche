@@ -253,11 +253,15 @@ impl RecvBuf {
                 },
 
                 RecvAction::Discard { .. } => {
-                    let Some(buf) = self.data.pop_watermarked(cap) else {
+                    // skip() advances the read offset without allocating;
+                    let available = self.data.len().min(cap);
+                    if available == 0 {
                         break;
-                    };
-
-                    buf.len()
+                    }
+                    let skip_len =
+                        VarInt::new(available as u64).map_err(|_| Error::InvalidFrame)?;
+                    self.data.skip(skip_len).map_err(map_reassembler_error)?;
+                    available
                 },
             };
 
