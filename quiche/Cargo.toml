@@ -85,7 +85,7 @@ sfv = { version = "0.9", optional = true }
 slab = "0.4"
 smallvec = { workspace = true, features = ["union"] }
 enum_dispatch = "0.3"
-s2n-quic-reassembler = { workspace = true }
+s2n-quic-core = { git = "https://github.com/aws/s2n-quic", default-features = false, features = ["std"] }
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.59", features = [

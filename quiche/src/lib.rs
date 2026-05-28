@@ -3480,6 +3480,42 @@ impl<F: BufFactory> Connection<F> {
 
         // Process packet payload.
         while payload.cap() > 0 {
+            // Fast path: STREAM frames (0x08–0x0f) are parsed and written
+            // directly to the receive buffer from the decrypted packet slice,
+            // avoiding an intermediate owned-buffer allocation.
+            let frame_type_byte = payload.peek_u8()?;
+            if matches!(frame_type_byte, 0x08..=0x0f) {
+                let ty = payload.get_varint()?;
+
+                let (stream_id, off, data, fin) =
+                    frame::parse_stream_frame_raw(ty, &mut payload)?;
+
+                qlog_with_type!(QLOG_PACKET_RX, self.qlog, _q, {
+                    qlog_frames.push(qlog::events::quic::QuicFrame::Stream {
+                        stream_id,
+                        offset: Some(off),
+                        fin: fin.then_some(true),
+                        raw: Some(Box::new(RawInfo {
+                            length: None,
+                            payload_length: Some(data.len() as u64),
+                            data: None,
+                        })),
+                    });
+                });
+
+                ack_elicited = true;
+                probing = false;
+
+                if let Err(e) =
+                    self.process_stream_data(stream_id, off, data, fin)
+                {
+                    frame_processing_err = Some(e);
+                    break;
+                }
+
+                continue;
+            }
+
             let frame = frame::Frame::from_bytes(&mut payload, hdr.ty)?;
 
             qlog_with_type!(QLOG_PACKET_RX, self.qlog, _q, {
@@ -8251,6 +8287,48 @@ impl<F: BufFactory> Connection<F> {
         )
     }
 
+    fn process_stream_data(
+        &mut self, stream_id: u64, off: u64, data: &[u8], fin: bool,
+    ) -> Result<()> {
+        if !stream::is_bidi(stream_id) && stream::is_local(stream_id, self.is_server) {
+            return Err(Error::InvalidStreamState(stream_id));
+        }
+
+        let max_rx_data_left = self.max_rx_data() - self.rx_data;
+
+        let stream = match self.get_or_create_stream(stream_id, false) {
+            Ok(v) => v,
+            Err(Error::Done) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+
+        let max_off = off + data.len() as u64;
+        let max_off_delta = max_off.saturating_sub(stream.recv.max_off());
+
+        if max_off_delta > max_rx_data_left {
+            return Err(Error::FlowControl);
+        }
+
+        let was_readable = stream.is_readable();
+        let priority_key = Arc::clone(&stream.priority_key);
+
+        let was_draining = stream.recv.is_draining();
+
+        stream.recv.write_slice(off, data, fin)?;
+
+        if !was_readable && stream.is_readable() {
+            self.streams.insert_readable(&priority_key);
+        }
+
+        self.rx_data += max_off_delta;
+
+        if was_draining {
+            self.flow_control.add_consumed(max_off_delta);
+        }
+
+        Ok(())
+    }
+
     /// Processes an incoming frame.
     fn process_frame(
         &mut self, frame: frame::Frame, hdr: &Header, recv_path_id: usize,
@@ -8511,63 +8589,7 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::InvalidPacket);
                 },
 
-            frame::Frame::Stream { stream_id, data } => {
-                // Peer can't send on our unidirectional streams.
-                if !stream::is_bidi(stream_id) &&
-                    stream::is_local(stream_id, self.is_server)
-                {
-                    return Err(Error::InvalidStreamState(stream_id));
-                }
-
-                let max_rx_data_left = self.max_rx_data() - self.rx_data;
-
-                // Get existing stream or create a new one, but if the stream
-                // has already been closed and collected, ignore the frame.
-                //
-                // This can happen if e.g. an ACK frame is lost, and the peer
-                // retransmits another frame before it realizes that the stream
-                // is gone.
-                //
-                // Note that it makes it impossible to check if the frame is
-                // illegal, since we have no state, but since we ignore the
-                // frame, it should be fine.
-                let stream = match self.get_or_create_stream(stream_id, false) {
-                    Ok(v) => v,
-
-                    Err(Error::Done) => return Ok(()),
-
-                    Err(e) => return Err(e),
-                };
-
-                // Check for the connection-level flow control limit.
-                let max_off_delta =
-                    data.max_off().saturating_sub(stream.recv.max_off());
-
-                if max_off_delta > max_rx_data_left {
-                    return Err(Error::FlowControl);
-                }
-
-                let was_readable = stream.is_readable();
-                let priority_key = Arc::clone(&stream.priority_key);
-
-                let was_draining = stream.recv.is_draining();
-
-                stream.recv.write(data)?;
-
-                if !was_readable && stream.is_readable() {
-                    self.streams.insert_readable(&priority_key);
-                }
-
-                self.rx_data += max_off_delta;
-
-                if was_draining {
-                    // When a stream is in draining state it will not queue
-                    // incoming data for the application to read, so consider
-                    // the received data as consumed, which might trigger a flow
-                    // control update.
-                    self.flow_control.add_consumed(max_off_delta);
-                }
-            },
+            frame::Frame::Stream { .. } => unreachable!(),
 
             frame::Frame::StreamHeader { .. } => unreachable!(),
 

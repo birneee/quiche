@@ -27,9 +27,9 @@
 use std::time::Duration;
 use std::time::Instant;
 
-use s2n_quic_reassembler::Error as ReassemblerError;
-use s2n_quic_reassembler::Reassembler;
-use s2n_quic_reassembler::VarInt;
+use s2n_quic_core::buffer::Error as ReassemblerError;
+use s2n_quic_core::buffer::Reassembler;
+use s2n_quic_core::varint::VarInt;
 
 use crate::stream::RecvAction;
 use crate::stream::RecvBufResetReturn;
@@ -102,62 +102,66 @@ impl RecvBuf {
     /// as handling incoming data that overlaps data that is already in the
     /// buffer.
     pub fn write(&mut self, buf: RangeBuf) -> Result<()> {
-        if buf.max_off() > self.max_data() {
+        self.write_slice(buf.off(), &buf, buf.fin())
+    }
+
+    /// Inserts a chunk of data given as a raw slice, avoiding an intermediate `RangeBuf`.
+    pub fn write_slice(&mut self, off: u64, data: &[u8], fin: bool) -> Result<()> {
+        let max_off = off + data.len() as u64;
+
+        if max_off > self.max_data() {
             return Err(Error::FlowControl);
         }
 
         if let Some(fin_off) = self.fin_off {
             // Stream's size is known, forbid data beyond that point.
-            if buf.max_off() > fin_off {
+            if max_off > fin_off {
                 return Err(Error::FinalSize);
             }
 
             // Stream's size is already known, forbid changing it.
-            if buf.fin() && fin_off != buf.max_off() {
+            if fin && fin_off != max_off {
                 return Err(Error::FinalSize);
             }
         }
 
         // Stream's known size is lower than data already received.
-        if buf.fin() && buf.max_off() < self.len {
+        if fin && max_off < self.len {
             return Err(Error::FinalSize);
         }
 
         // No need to store empty buffer that doesn't carry the fin flag.
-        if !buf.fin() && buf.is_empty() {
+        if !fin && data.is_empty() {
             return Ok(());
         }
 
         // Check if data is fully duplicate, that is the buffer's max offset is
         // lower or equal to the offset already stored in the recv buffer.
-        if self.off_front() >= buf.max_off() {
+        if self.off_front() >= max_off {
             // An exception is applied to empty range buffers, because an empty
             // buffer's max offset matches the max offset of the recv buffer.
             //
             // By this point all spurious empty buffers should have already been
             // discarded, so allowing empty buffers here should be safe.
-            if !buf.is_empty() {
+            if !data.is_empty() {
                 return Ok(());
             }
         }
 
         // We already saved the final offset, so there's nothing else we
-        // need to keep from the RangeBuf if it's empty.
-        if self.fin_off.is_some() && buf.is_empty() {
+        // need to keep from the data if it's empty.
+        if self.fin_off.is_some() && data.is_empty() {
             return Ok(());
         }
 
-        let max_off = buf.max_off();
-
         if !self.drain {
-            let offset =
-                VarInt::new(buf.off()).map_err(|_| Error::InvalidFrame)?;
+            let offset = VarInt::new(off).map_err(|_| Error::InvalidFrame)?;
             VarInt::new(max_off).map_err(|_| Error::InvalidFrame)?;
 
-            let result = if buf.fin() {
-                self.data.write_at_fin(offset, &buf)
+            let result = if fin {
+                self.data.write_at_fin(offset, data)
             } else {
-                self.data.write_at(offset, &buf)
+                self.data.write_at(offset, data)
             };
 
             result.map_err(map_reassembler_error)?;
@@ -168,9 +172,9 @@ impl RecvBuf {
 
         self.len = self.len.max(max_off);
 
-        if buf.fin() {
+        if fin {
             self.fin_off = Some(max_off);
-            self.fin_pending |= max_off == self.off && buf.is_empty();
+            self.fin_pending |= max_off == self.off && data.is_empty();
         }
 
         Ok(())
@@ -249,11 +253,11 @@ impl RecvBuf {
                 },
 
                 RecvAction::Discard { .. } => {
-                    let Some(buf_len) = self.data.pop_len_watermarked(cap) else {
+                    let Some(buf) = self.data.pop_watermarked(cap) else {
                         break;
                     };
 
-                    buf_len
+                    buf.len()
                 },
             };
 

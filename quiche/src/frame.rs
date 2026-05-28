@@ -1367,6 +1367,14 @@ pub fn encode_dgram_header(length: u64, b: &mut octets::OctetsMut) -> Result<()>
 }
 
 fn parse_stream_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
+    let (stream_id, offset, data, fin) = parse_stream_frame_raw(ty, b)?;
+    let data = <RangeBuf>::from(data, offset, fin);
+    Ok(Frame::Stream { stream_id, data })
+}
+
+pub(crate) fn parse_stream_frame_raw<'a>(
+    ty: u64, b: &mut octets::Octets<'a>,
+) -> Result<(u64, u64, &'a [u8], bool)> {
     let first = ty as u8;
 
     let stream_id = b.get_varint()?;
@@ -1390,9 +1398,7 @@ fn parse_stream_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
     let fin = first & 0x01 != 0;
 
     let data = b.get_bytes(len)?;
-    let data = <RangeBuf>::from(data.as_ref(), offset, fin);
-
-    Ok(Frame::Stream { stream_id, data })
+    Ok((stream_id, offset, data.buf(), fin))
 }
 
 fn parse_datagram_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
