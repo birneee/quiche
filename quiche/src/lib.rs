@@ -359,17 +359,18 @@
 //! quiche defines a number of [feature flags] to reduce the amount of compiled
 //! code and dependencies:
 //!
-//! * `boringssl-vendored` (default): Build the vendored BoringSSL library.
-//!
-//! * `boringssl-boring-crate`: Use the BoringSSL library provided by the
-//!   [boring] crate. It takes precedence over `boringssl-vendored` if both
-//!   features are enabled.
+//! * `boringssl-boring-crate` (default): Use the BoringSSL library provided by
+//!   the [boring] crate.
 //!
 //! * `pkg-config-meta`: Generate pkg-config metadata file for libquiche.
 //!
 //! * `ffi`: Build and expose the FFI API.
 //!
 //! * `qlog`: Enable support for the [qlog] logging format.
+//!
+//! * `custom-client-dcid`: Allow clients to supply a custom DCID when
+//!   initiating a connection. Dangerous if the DCID does not meet QUIC's
+//!   unpredictability and length requirements.
 //!
 //! [feature flags]: https://doc.rust-lang.org/cargo/reference/manifest.html#the-features-section
 //! [boring]: https://crates.io/crates/boring
@@ -479,9 +480,6 @@ const PAYLOAD_LENGTH_LEN: usize = 2;
 const MAX_UNDECRYPTABLE_PACKETS: usize = 10;
 
 const RESERVED_VERSION_MASK: u32 = 0xfafafafa;
-
-// The default size of the receiver connection flow control window.
-const DEFAULT_CONNECTION_WINDOW: u64 = 48 * 1024;
 
 // The maximum size of the receiver connection flow control window.
 const MAX_CONNECTION_WINDOW: u64 = 24 * 1024 * 1024;
@@ -607,10 +605,6 @@ pub struct Config {
     track_unknown_transport_params: Option<usize>,
 
     initial_rtt: Duration,
-
-    /// When true, uses the initial max data (for connection
-    /// and stream) as the initial flow control window.
-    use_initial_max_data_as_flow_control_win: bool,
 }
 
 // See https://quicwg.org/base-drafts/rfc9000.html#section-15
@@ -689,8 +683,6 @@ impl Config {
 
             track_unknown_transport_params: None,
             initial_rtt: DEFAULT_INITIAL_RTT,
-
-            use_initial_max_data_as_flow_control_win: false,
         })
     }
 
@@ -1048,10 +1040,14 @@ impl Config {
 
     /// Sets the `ack_delay_exponent` transport parameter.
     ///
+    /// Values above the RFC 9000 maximum of
+    /// [`MAX_ACK_DELAY_EXPONENT`] (20) are clamped to that
+    /// maximum.
+    ///
     /// The default value is `3`.
     pub fn set_ack_delay_exponent(&mut self, v: u64) {
         self.local_transport_params.ack_delay_exponent =
-            cmp::min(v, octets::MAX_VAR_INT);
+            cmp::min(v, MAX_ACK_DELAY_EXPONENT);
     }
 
     /// Sets the `max_ack_delay` transport parameter.
@@ -1256,16 +1252,10 @@ impl Config {
     /// Sets whether the initial max data value should be used as the initial
     /// flow control window.
     ///
-    /// If set to true, the initial flow control window for streams and the
-    /// connection itself will be set to the initial max data value for streams
-    /// and the connection respectively. If false, the window is set to the
-    /// minimum of initial max data and `DEFAULT_STREAM_WINDOW` or
-    /// `DEFAULT_CONNECTION_WINDOW`
-    ///
-    /// The default is false.
-    pub fn set_use_initial_max_data_as_flow_control_win(&mut self, v: bool) {
-        self.use_initial_max_data_as_flow_control_win = v;
-    }
+    /// This is now always enabled and this method is a no-op. It will be
+    /// removed in a future release.
+    #[deprecated(note = "This is now always enabled. This method is a no-op.")]
+    pub fn set_use_initial_max_data_as_flow_control_win(&mut self, _v: bool) {}
 }
 
 /// Tracks the health of the tx_buffered value.
@@ -1420,12 +1410,6 @@ where
     /// The send capacity factor.
     tx_cap_factor: f64,
 
-    /// Number of bytes buffered in the send buffer.
-    tx_buffered: usize,
-
-    /// Tracks the health of tx_buffered.
-    tx_buffered_state: TxBufferTrackingState,
-
     /// Total number of bytes sent to the peer.
     tx_data: u64,
 
@@ -1452,7 +1436,7 @@ where
     lost_bytes: u64,
 
     /// Streams map, indexed by stream ID.
-    streams: stream::StreamMap<F>,
+    pub(crate) streams: stream::StreamMap<F>,
 
     /// Peer's original destination connection ID. Used by the client to
     /// validate the server's transport parameter.
@@ -2059,12 +2043,7 @@ impl<F: BufFactory> Connection<F> {
             reset_token,
         );
 
-        let initial_flow_control_window =
-            if config.use_initial_max_data_as_flow_control_win {
-                max_rx_data
-            } else {
-                cmp::min(max_rx_data / 2 * 3, DEFAULT_CONNECTION_WINDOW)
-            };
+        let initial_flow_control_window = max_rx_data;
         let mut conn = Connection {
             version: config.version,
 
@@ -2132,9 +2111,6 @@ impl<F: BufFactory> Connection<F> {
 
             tx_cap: 0,
             tx_cap_factor: config.tx_cap_factor,
-
-            tx_buffered: 0,
-            tx_buffered_state: TxBufferTrackingState::Ok,
 
             tx_data: 0,
             max_tx_data: 0,
@@ -2239,10 +2215,6 @@ impl<F: BufFactory> Connection<F> {
 
             max_amplification_factor: config.max_amplification_factor,
         };
-        conn.streams.set_use_initial_max_data_as_flow_control_win(
-            config.use_initial_max_data_as_flow_control_win,
-        );
-
         if let Some(retry_cids) = retry_cids {
             conn.local_transport_params
                 .original_destination_connection_id =
@@ -2771,6 +2743,7 @@ impl<F: BufFactory> Connection<F> {
         params: TransportParams, is_server: bool, ssl: &mut boring::ssl::SslRef,
     ) -> Result<()> {
         use foreign_types_shared::ForeignTypeRef;
+        use std::mem::ManuallyDrop;
 
         // In order to apply the new parameter to the TLS state before TPs are
         // written into a TLS message, we need to re-encode all TPs immediately.
@@ -2778,35 +2751,27 @@ impl<F: BufFactory> Connection<F> {
         // Since we don't have direct access to the main `Connection` object, we
         // need to re-create the `Handshake` state from the `SslRef`.
         //
-        // SAFETY: the `Handshake` object must not be drop()ed, otherwise it
-        // would free the underlying BoringSSL structure.
-        let mut handshake =
-            unsafe { tls::Handshake::from_ptr(ssl.as_ptr() as _) };
-        handshake.set_quic_transport_params(&params, is_server)?;
+        // Wrap the temporary `Handshake` in `ManuallyDrop` because this is only
+        // a borrowed view of `ssl`. The caller retains ownership of the
+        // underlying BoringSSL object.
+        let mut handshake = ManuallyDrop::new(unsafe {
+            tls::Handshake::from_ptr(ssl.as_ptr() as _)
+        });
 
-        // Avoid running `drop(handshake)` as that would free the underlying
-        // handshake state.
-        std::mem::forget(handshake);
-
-        Ok(())
+        handshake.set_quic_transport_params(&params, is_server)
     }
 
     /// Sets the `use_initial_max_data_as_flow_control_win` flag during SSL
     /// handshake.
     ///
-    /// This function can only be called inside one of BoringSSL's handshake
-    /// callbacks, before any packet has been sent. Calling this function any
-    /// other time will have no effect.
-    ///
-    /// See [`Connection::enable_use_initial_max_data_as_flow_control_win()`].
+    /// This is now always enabled and this method is a no-op. It will be
+    /// removed in a future release.
     #[cfg(feature = "boringssl-boring-crate")]
     #[cfg_attr(docsrs, doc(cfg(feature = "boringssl-boring-crate")))]
+    #[deprecated(note = "This is now always enabled. This method is a no-op.")]
     pub fn set_use_initial_max_data_as_flow_control_win_in_handshake(
-        ssl: &mut boring::ssl::SslRef,
+        _ssl: &mut boring::ssl::SslRef,
     ) -> Result<()> {
-        let ex_data = tls::ExData::from_ssl_ref(ssl).ok_or(Error::TlsFail)?;
-
-        ex_data.use_initial_max_data_as_flow_control_win = true;
         Ok(())
     }
 
@@ -3630,12 +3595,9 @@ impl<F: BufFactory> Connection<F> {
                         length,
                         ..
                     } => {
-                        // Update tx_buffered and emit qlog before checking if the
-                        // stream still exists.  The client does need to ACK
-                        // frames that were received after the client sends a
-                        // ResetStream.
-                        self.tx_buffered =
-                            self.tx_buffered.saturating_sub(length);
+                        // Emit qlog before checking if the stream still exists.
+                        // The client does need to ACK frames that were received
+                        // after the client sends a ResetStream.
 
                         qlog_with_type!(QLOG_DATA_MV, self.qlog, q, {
                             let ev_data = EventData::QuicStreamDataMoved(
@@ -3661,8 +3623,7 @@ impl<F: BufFactory> Connection<F> {
                             None => continue,
                         };
 
-                        stream.send.ack_and_drop(offset, length);
-
+                        let dropped = stream.send.ack_and_drop(offset, length);
                         let priority_key = Arc::clone(&stream.priority_key);
 
                         // Only collect the stream if it is complete and not
@@ -3694,6 +3655,14 @@ impl<F: BufFactory> Connection<F> {
                         if is_complete && !is_readable && !is_writable {
                             let local = stream.local;
                             self.streams.collect(stream_id, local);
+                        }
+
+                        // Update tx_bufferd to reflect any data that was dropped
+                        // from stream buffers (e.g., data
+                        // marked for retransmission but then
+                        // acked before it could be resent).
+                        if dropped > 0 {
+                            self.streams.sub_tx_buffered(dropped);
                         }
                     },
 
@@ -4185,12 +4154,9 @@ impl<F: BufFactory> Connection<F> {
                             Some(v) if !v.send.is_stopped() => v,
 
                             // Data on a closed stream will not be retransmitted
-                            // or acked after it is declared lost, so update
-                            // tx_buffered and qlog.
+                            // or acked after it is declared lost, so just drop
+                            // it.
                             _ => {
-                                self.tx_buffered =
-                                    self.tx_buffered.saturating_sub(length);
-
                                 qlog_with_type!(QLOG_DATA_MV, self.qlog, q, {
                                     let ev_data = EventData::QuicStreamDataMoved(
                                         qlog::events::quic::StreamDataMoved {
@@ -4218,7 +4184,8 @@ impl<F: BufFactory> Connection<F> {
 
                         let empty_fin = length == 0 && fin;
 
-                        stream.send.retransmit(offset, length);
+                        let retransmitted =
+                            stream.send.retransmit(offset, length);
 
                         // If the stream is now flushable push it to the
                         // flushable queue, but only if it wasn't already
@@ -4232,6 +4199,13 @@ impl<F: BufFactory> Connection<F> {
                             let priority_key = Arc::clone(&stream.priority_key);
                             self.streams.insert_flushable(&priority_key);
                         }
+
+                        // Update tx_buffered when data is marked for
+                        // retransmission (it was decremented when emitted).
+                        // Only increment by the actual amount retransmitted,
+                        // which may be less than `length` if some data was
+                        // already acked.
+                        self.streams.add_tx_buffered(retransmitted);
 
                         self.stream_retrans_bytes += length as u64;
                         p.stream_retrans_bytes += length as u64;
@@ -4393,7 +4367,9 @@ impl<F: BufFactory> Connection<F> {
                 }
             }
         }
-        self.check_tx_buffered_invariant();
+
+        #[cfg(debug_assertions)]
+        self.streams.debug_check_tx_buffered_consistency();
 
         let is_app_limited = self.delivery_rate_check_if_app_limited();
         let n_paths = self.paths.len();
@@ -5296,6 +5272,9 @@ impl<F: BufFactory> Connection<F> {
                     self.streams.insert_flushable(&priority_key);
                 }
 
+                // Update tx_buffered when data is emitted.
+                self.streams.sub_tx_buffered(len);
+
                 #[cfg(feature = "fuzzing")]
                 // Coalesce STREAM frames when fuzzing.
                 if left > frame::MAX_STREAM_OVERHEAD {
@@ -6133,8 +6112,7 @@ impl<F: BufFactory> Connection<F> {
 
         self.tx_data += sent as u64;
 
-        self.tx_buffered += sent;
-        self.check_tx_buffered_invariant();
+        self.streams.add_tx_buffered(sent);
 
         qlog_with_type!(QLOG_DATA_MV, self.qlog, q, {
             let ev_data = EventData::QuicStreamDataMoved(
@@ -6279,14 +6257,19 @@ impl<F: BufFactory> Connection<F> {
             },
 
             Shutdown::Write => {
+                // Save the buffered length before shutdown (shutdown clears the
+                // buffer).
+                let buffered_len = stream.send.buffered_bytes() as usize;
+
                 let (final_size, unsent) = stream.send.shutdown()?;
 
                 // Claw back some flow control allowance from data that was
                 // buffered but not actually sent before the stream was reset.
                 self.tx_data = self.tx_data.saturating_sub(unsent);
 
-                self.tx_buffered =
-                    self.tx_buffered.saturating_sub(unsent as usize);
+                // Update tx_buffered: subtract only the buffered data, not
+                // inflight data.
+                self.streams.sub_tx_buffered(buffered_len);
 
                 // These drops in qlog are a bit weird, but the only way to ensure
                 // that all bytes that are moved from App to Transport in
@@ -6535,6 +6518,36 @@ impl<F: BufFactory> Connection<F> {
         };
 
         stream.recv.is_fin()
+    }
+
+    /// Returns true if the specified stream is closed.
+    ///
+    /// For bidirectional streams this happens when both the receive and send
+    /// sides have signaled `fin`. For unidirectional streams only the
+    /// relevant direction is checked, depending on whether the stream was
+    /// created locally or not.
+    ///
+    /// This also returns true if the stream has already been collected, but
+    /// returns false if the stream was never opened.
+    #[inline]
+    pub fn stream_closed(&self, stream_id: u64) -> bool {
+        let Some(stream) = self.streams.get(stream_id) else {
+            return self.streams.is_collected(stream_id);
+        };
+
+        match (stream.bidi, stream.local) {
+            // For bidirectional streams both directions must have signaled
+            // FIN.
+            (true, _) => stream.recv.is_fin() && stream.send.is_fin(),
+
+            // For unidirectional streams created locally, only the send side
+            // is checked.
+            (false, true) => stream.send.is_fin(),
+
+            // For unidirectional streams created by the peer, only the
+            // receive side is checked.
+            (false, false) => stream.recv.is_fin(),
+        }
     }
 
     /// Returns the number of bidirectional streams that can be created
@@ -7299,12 +7312,16 @@ impl<F: BufFactory> Connection<F> {
         self.ids.active_source_cids()
     }
 
-    /// Returns the number of source Connection IDs that should be provided
-    /// to the peer without exceeding the limit it advertised.
+    /// Returns the number of additional source Connection IDs that can be
+    /// provided to the peer without exceeding the limit it advertised.
     ///
-    /// This will automatically limit the number of Connection IDs to the
-    /// minimum between the locally configured active connection ID limit,
-    /// and the one sent by the peer.
+    /// The limit is the minimum of the locally configured active connection
+    /// ID limit and the one sent by the peer.
+    ///
+    /// Returns `0` when the peer's limit is already reached or temporarily
+    /// exceeded (e.g. during a SCID rotation where a retirement is in
+    /// flight and `active_scids()` transiently exceeds the advertised
+    /// limit).
     ///
     /// To obtain the maximum possible value allowed by the peer an application
     /// can instead inspect the [`peer_active_conn_id_limit`] value.
@@ -7317,7 +7334,7 @@ impl<F: BufFactory> Connection<F> {
             self.local_transport_params.active_conn_id_limit,
         ) as usize;
 
-        max_active_source_cids - self.active_scids()
+        max_active_source_cids.saturating_sub(self.active_scids())
     }
 
     /// Requests the retirement of the destination Connection ID used by the
@@ -7809,7 +7826,11 @@ impl<F: BufFactory> Connection<F> {
             path_challenge_rx_count: self.path_challenge_rx_count,
             amplification_limited_count: self.amplification_limited_count,
             bytes_in_flight_duration: self.bytes_in_flight_duration(),
-            tx_buffered_state: self.tx_buffered_state,
+            tx_buffered_state: if self.streams.tx_buffered_is_consistent() {
+                TxBufferTrackingState::Ok
+            } else {
+                TxBufferTrackingState::Inconsistent
+            },
         }
     }
 
@@ -7984,8 +8005,6 @@ impl<F: BufFactory> Connection<F> {
             pmtud: None,
 
             is_server: self.is_server,
-
-            use_initial_max_data_as_flow_control_win: false,
         };
 
         if self.handshake_completed {
@@ -8035,10 +8054,6 @@ impl<F: BufFactory> Connection<F> {
                         self.local_transport_params =
                             ex_data.local_transport_params;
                     }
-                }
-
-                if ex_data.use_initial_max_data_as_flow_control_win {
-                    self.enable_use_initial_max_data_as_flow_control_win();
                 }
 
                 // Try to parse transport parameters as soon as the first flight
@@ -8096,7 +8111,7 @@ impl<F: BufFactory> Connection<F> {
             self.undecryptable_pkts.clear();
 
             trace!("{} connection established: proto={:?} cipher={:?} curve={:?} sigalg={:?} resumed={} {:?}",
-                   &self.trace_id,
+                   self.trace_id,
                    std::str::from_utf8(self.application_proto()),
                    self.handshake.cipher(),
                    self.handshake.curve(),
@@ -8106,19 +8121,6 @@ impl<F: BufFactory> Connection<F> {
         }
 
         Ok(())
-    }
-
-    /// Use the value of the intial max_data / initial stream max_data setting
-    /// as the initial flow control window for the connection and streams.
-    /// The connection-level flow control window will only be changed if it
-    /// hasn't been auto tuned yet. For streams: only newly created streams
-    /// receive the new setting.
-    fn enable_use_initial_max_data_as_flow_control_win(&mut self) {
-        self.flow_control.set_window_if_not_tuned_yet(
-            self.local_transport_params.initial_max_data,
-        );
-        self.streams
-            .set_use_initial_max_data_as_flow_control_win(true);
     }
 
     /// Selects the packet type for the next outgoing packet.
@@ -8422,6 +8424,10 @@ impl<F: BufFactory> Connection<F> {
 
                 let priority_key = Arc::clone(&stream.priority_key);
 
+                // Save the buffered length before stopping (stop clears the
+                // buffer).
+                let buffered_len = stream.send.buffered_bytes() as usize;
+
                 // Try stopping the stream.
                 if let Ok((final_size, unsent)) = stream.send.stop(error_code) {
                     // Claw back some flow control allowance from data that was
@@ -8432,8 +8438,9 @@ impl<F: BufFactory> Connection<F> {
                     // to touch it here.
                     self.tx_data = self.tx_data.saturating_sub(unsent);
 
-                    self.tx_buffered =
-                        self.tx_buffered.saturating_sub(unsent as usize);
+                    // Update tx_buffered: subtract only the buffered data, not
+                    // inflight data.
+                    self.streams.sub_tx_buffered(buffered_len);
 
                     // These drops in qlog are a bit weird, but the only way to
                     // ensure that all bytes that are moved from App to Transport
@@ -8921,30 +8928,11 @@ impl<F: BufFactory> Connection<F> {
             .map(|(_, p)| p.recovery.cwnd_available())
             .sum();
 
-        ((self.tx_buffered + self.dgram_send_queue_byte_size()) < cwin_available) &&
+        ((self.streams.tx_buffered() + self.dgram_send_queue_byte_size()) <
+            cwin_available) &&
             (self.tx_data.saturating_sub(self.last_tx_data)) <
                 cwin_available as u64 &&
             cwin_available > 0
-    }
-
-    fn check_tx_buffered_invariant(&mut self) {
-        // tx_buffered should track bytes queued in the stream buffers
-        // and unacked retransmitable bytes in the network.
-        // If tx_buffered > 0 mark the tx_buffered_state if there are no
-        // flushable streams and there no inflight bytes.
-        //
-        // It is normal to have tx_buffered == 0 while there are inflight bytes
-        // since not QUIC frames are retransmittable; inflight tracks all bytes
-        // on the network which are subject to congestion control.
-        if self.tx_buffered > 0 &&
-            !self.streams.has_flushable() &&
-            !self
-                .paths
-                .iter()
-                .any(|(_, p)| p.recovery.bytes_in_flight() > 0)
-        {
-            self.tx_buffered_state = TxBufferTrackingState::Inconsistent;
-        }
     }
 
     fn set_initial_dcid(
@@ -9348,6 +9336,7 @@ impl std::fmt::Display for AddrTupleFmt {
 ///
 /// [`stats()`]: struct.Connection.html#method.stats
 #[derive(Clone, Default)]
+#[non_exhaustive]
 pub struct Stats {
     /// The number of QUIC packets received.
     pub recv: usize,
@@ -9436,6 +9425,10 @@ pub struct Stats {
     pub bytes_in_flight_duration: Duration,
 
     /// Health state of the connection's tx_buffered.
+    ///
+    /// Indicates whether the streams.tx_buffered value is consistent with
+    /// the actual sum of bytes buffered across all stream send buffers.
+    /// Returns `Ok` if consistent, `Inconsistent` if there's a mismatch.
     pub tx_buffered_state: TxBufferTrackingState,
 }
 
@@ -9485,6 +9478,7 @@ pub use crate::transport_params::TransportParams;
 pub use crate::transport_params::UnknownTransportParameter;
 pub use crate::transport_params::UnknownTransportParameterIterator;
 pub use crate::transport_params::UnknownTransportParameters;
+pub use crate::transport_params::MAX_ACK_DELAY_EXPONENT;
 
 pub use crate::buffers::BufFactory;
 pub use crate::buffers::BufSplit;
