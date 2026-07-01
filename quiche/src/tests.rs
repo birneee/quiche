@@ -12836,3 +12836,26 @@ fn server_qlog() {
         panic!("expected Qlog event");
     }
 }
+
+#[test]
+fn stream_send_low_priority_does_not_starve_high_priority() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    // Connection budget equals one stream's limit so a single low-priority
+    // stream_send can exhaust it entirely.
+    config.set_initial_max_data(15);
+    config.set_initial_max_stream_data_bidi_local(15);
+    config.set_initial_max_stream_data_bidi_remote(15);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    assert_eq!(pipe.client.stream_priority(0, 7, false), Ok(()));
+    assert_eq!(pipe.client.stream_priority(4, 0, false), Ok(()));
+
+    // Low-priority stream fills the connection budget first.
+    assert_eq!(pipe.client.stream_send(0, &[b'L'; 15], false), Ok(15));
+
+    // High-priority stream must still be able to buffer data despite the
+    // low-priority stream having consumed tx_cap.
+    assert_eq!(pipe.client.stream_send(4, &[b'H'; 1], false), Ok(1));
+}
