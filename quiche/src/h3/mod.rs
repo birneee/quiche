@@ -1188,8 +1188,8 @@ impl Connection {
     /// If successful, the ID of the stream is returned.
     /// `InternalError` is returned when `webtransport_streams_enabled` is not
     /// set.
-    pub fn open_webtransport_stream(
-        &mut self, conn: &mut super::Connection, bidi: bool,
+    pub fn open_webtransport_stream<F: BufFactory>(
+        &mut self, conn: &mut super::Connection<F>, bidi: bool,
     ) -> Result<u64> {
         if !self.webtransport_streams_enabled {
             return Err(Error::InternalError);
@@ -3374,8 +3374,8 @@ impl Connection {
 
     /// Returns an iterator over WebTransport streams that have outstanding data to read.
     /// Iterator is always empty if `webtransport_streams_enabled` is not set.
-    pub fn readable_webtransport_streams(
-        &self, conn: &super::Connection,
+    pub fn readable_webtransport_streams<F: BufFactory>(
+        &self, conn: &super::Connection<F>,
     ) -> super::StreamIter {
         super::StreamIter::filter(&conn.readable(), |stream_id| {
             self.streams.get(stream_id).unwrap().ty()
