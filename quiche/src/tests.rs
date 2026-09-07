@@ -7331,8 +7331,8 @@ fn stream_priority(
 
     // Server prioritizes streams as follows:
     //  * Stream 8 and 16 have the same priority but are non-incremental.
-    //  * Stream 4, 12 and 20 have the same priority but 20 is non-incremental
-    //    and 4 and 12 are incremental.
+    //  * Stream 4, 12 and 20 have the same priority but 20 is non-incremental and
+    //  4 and 12 are incremental.
     //  * Stream 0 is on its own.
 
     stream_recv_discard(&mut pipe.server, discard, 0).unwrap();
