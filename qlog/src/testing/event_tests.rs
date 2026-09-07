@@ -143,7 +143,7 @@ fn packet_sent_event_some_frames() {
 
     let ev_data = EventData::QuicPacketSent(PacketSent {
         header: pkt_hdr,
-        frames: Some(frames.into()),
+        frames: Some(frames),
         raw: Some(RawInfo {
             length: Some(1251),
             payload_length: Some(1224),
@@ -308,11 +308,11 @@ fn ack_range_as_range_inclusive() {
 #[test]
 fn ack_range_serialize() {
     assert_eq!(
-        serde_json::to_value(&AckRange::new(5, 5)).unwrap(),
+        serde_json::to_value(AckRange::new(5, 5)).unwrap(),
         serde_json::json!([5])
     );
     assert_eq!(
-        serde_json::to_value(&AckRange::new(0, 9)).unwrap(),
+        serde_json::to_value(AckRange::new(0, 9)).unwrap(),
         serde_json::json!([0, 9])
     );
 }
@@ -347,8 +347,8 @@ fn ack_frame_serialize_mixed_ranges() {
 
 #[test]
 fn ack_frame_serialize_unordered_ranges() {
-    // draft-ietf-quic-qlog-quic-events-12 specified that ack ranges can be in any
-    // order
+    // `draft-ietf-quic-qlog-quic-events-12` specified that ACK ranges can
+    // appear in any order.
     let frame = QuicFrame::Ack {
         ack_delay: None,
         acked_ranges: Some(vec![
@@ -389,8 +389,8 @@ fn ack_frame_roundtrip() {
 
 #[test]
 fn ack_frame_roundtrip_preserve_order() {
-    // draft-ietf-quic-qlog-quic-events-12 specifies that ack ranges may appear in
-    // any order.
+    // `draft-ietf-quic-qlog-quic-events-12` specifies that ACK ranges may
+    // appear in any order.
     let frame = QuicFrame::Ack {
         ack_delay: Some(1.5),
         acked_ranges: Some(vec![

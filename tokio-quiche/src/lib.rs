@@ -74,8 +74,24 @@
 //! # Feature Flags
 //!
 //! tokio-quiche supports a number of feature flags to enable experimental
-//! features, performance enhancements, and additional telemetry. By default, no
-//! feature flags are enabled.
+//! features, performance enhancements, and additional telemetry.
+//!
+//! Enabled by default:
+//!
+//! - `qlog-gzip`: Forwards to the `qlog` crate's `gzip` feature so QLOG output
+//!   can be emitted as `.sqlog.gz` via `flate2`.
+//! - `qlog-zstd`: Forwards to the `qlog` crate's `zstd` feature so QLOG output
+//!   can be emitted as `.sqlog.zst`. Pulls in the `zstd` crate (C dependency
+//!   via `zstd-sys`).
+//!
+//! Both compression features may be enabled together; the algorithm
+//! is selected per connection at runtime via
+//! [`settings::QuicSettings::qlog_compression`]. Disable both with
+//! `default-features = false` to opt out of the extra dependencies;
+//! the default `QlogCompression::None` keeps writing raw `.sqlog`
+//! files in that configuration.
+//!
+//! Off by default:
 //!
 //! - `rpk`: Support for raw public keys (RPK) in QUIC handshakes (via
 //!   [boring]).
@@ -230,11 +246,9 @@ pub(crate) fn capture_quiche_logs() {
 
         slog_stdlog::init_with_level(normalized_level).unwrap();
 
-        // The slog Drain becomes `slog::Discard` when the scope_guard is dropped,
-        // and you can't set the global logger again because of a mandate
-        // in the `log` crate. We have to manually `forget` the scope
-        // guard so that the logger remains registered for the duration of the
-        // process.
-        std::mem::forget(scope_guard)
+        // Dropping the scope guard replaces the slog Drain with
+        // `slog::Discard`. The `log` crate cannot reset the global
+        // logger, so retain the guard for the process lifetime.
+        let _scope_guard = std::mem::ManuallyDrop::new(scope_guard);
     });
 }

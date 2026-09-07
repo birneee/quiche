@@ -42,6 +42,10 @@ use qlog::events::quic::TransportInitiator;
 #[cfg(feature = "qlog")]
 use qlog::events::EventData;
 
+/// Maximum permitted value of the `ack_delay_exponent` transport parameter,
+/// as mandated by RFC 9000 Section 18.2.
+pub const MAX_ACK_DELAY_EXPONENT: u64 = 20;
+
 /// QUIC Unknown Transport Parameter.
 ///
 /// A QUIC transport parameter that is not specifically recognized
@@ -315,7 +319,7 @@ impl TransportParams {
                 0x000a => {
                     let ack_delay_exponent = val.get_varint()?;
 
-                    if ack_delay_exponent > 20 {
+                    if ack_delay_exponent > MAX_ACK_DELAY_EXPONENT {
                         return Err(Error::InvalidTransportParam);
                     }
 
@@ -373,8 +377,7 @@ impl TransportParams {
                 // Track unknown transport parameters specially.
                 unknown_tp_id => {
                     if let Some(unknown_params) = &mut tp.unknown_params {
-                        // It is _not_ an error not to have space enough to track
-                        // an unknown parameter.
+                        // Failing to track an unknown parameter is harmless.
                         let _ = unknown_params.push(UnknownTransportParameter {
                             id: unknown_tp_id,
                             value: val.buf(),
@@ -498,7 +501,7 @@ impl TransportParams {
         }
 
         if tp.ack_delay_exponent != 0 {
-            assert!(tp.ack_delay_exponent <= octets::MAX_VAR_INT);
+            assert!(tp.ack_delay_exponent <= MAX_ACK_DELAY_EXPONENT);
             TransportParams::encode_param(
                 &mut b,
                 0x000a,

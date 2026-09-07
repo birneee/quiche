@@ -186,8 +186,7 @@ mod tests {
         }
     }
 
-    // Events aren't clonable in the version of qlog we have, so lazy solution for
-    // now
+    // Events are not cloneable in this qlog version, so use a helper.
     fn events() -> Vec<Event> {
         let mut events = vec![];
         let scid = [0x7e, 0x37, 0xe4, 0xdc, 0xc6, 0x68, 0x2d, 0xa8];
@@ -227,7 +226,7 @@ mod tests {
 
         let event_data = QuicPacketSent(PacketSent {
             header: pkt_hdr.clone(),
-            frames: Some(frames.into()),
+            frames: Some(frames),
             stateless_reset_token: None,
             supported_versions: None,
             raw: Some(raw.clone()),
@@ -249,7 +248,7 @@ mod tests {
 
         let event_data = QuicPacketSent(PacketSent {
             header: pkt_hdr.clone(),
-            frames: Some(frames.into()),
+            frames: Some(frames),
             stateless_reset_token: None,
             supported_versions: None,
             raw: Some(raw.clone()),
@@ -270,7 +269,7 @@ mod tests {
 
         let event_data = QuicPacketSent(PacketSent {
             header: pkt_hdr,
-            frames: Some(frames.into()),
+            frames: Some(frames),
             stateless_reset_token: None,
             supported_versions: None,
             raw: Some(raw),

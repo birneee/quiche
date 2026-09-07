@@ -46,6 +46,8 @@ use self::congestion::recovery::LegacyRecovery;
 use self::gcongestion::GRecovery;
 pub use gcongestion::BbrBwLoReductionStrategy;
 pub use gcongestion::BbrParams;
+#[cfg(feature = "internal")]
+pub use gcongestion::BbrRttJumpDetector;
 
 // Loss Recovery
 const INITIAL_PACKET_THRESHOLD: u64 = 3;
@@ -201,6 +203,8 @@ pub trait RecoveryOps {
     fn loss_probes(&self, epoch: packet::Epoch) -> usize;
     #[cfg(test)]
     fn inc_loss_probes(&mut self, epoch: packet::Epoch);
+    #[cfg(test)]
+    fn lost_frames_count(&self, epoch: packet::Epoch) -> usize;
 
     fn ping_sent(&mut self, epoch: packet::Epoch);
 
@@ -247,6 +251,9 @@ pub trait RecoveryOps {
     /// Maximum bandwidth estimate, if one is available.
     fn max_bandwidth(&self) -> Option<Bandwidth>;
 
+    /// Total number of confirmed persistent RTT jump episodes.
+    fn rtt_persistent_jump_count(&self) -> u64;
+
     /// Statistics from when a CCA first exited the startup phase.
     fn startup_exit(&self) -> Option<StartupExit>;
 
@@ -282,8 +289,8 @@ pub trait RecoveryOps {
     #[cfg(test)]
     fn pto_count(&self) -> u32;
 
-    // This value might be `None` when experiment `enable_relaxed_loss_threshold`
-    // is enabled for gcongestion
+    // This value might be `None` when the `enable_relaxed_loss_threshold`
+    // experiment is enabled for gcongestion.
     #[cfg(test)]
     fn pkt_thresh(&self) -> Option<u64>;
 
@@ -825,6 +832,7 @@ pub enum StartupExitReason {
 mod tests {
     use super::*;
     use crate::packet;
+    use crate::range_buf::RangeBuf;
     use crate::test_utils;
     use crate::CongestionControlAlgorithm;
     use crate::DEFAULT_INITIAL_RTT;
@@ -1483,9 +1491,9 @@ mod tests {
         let mut r = Recovery::new(&cfg);
         assert_eq!(r.rtt(), DEFAULT_INITIAL_RTT);
 
-        // Pick time between and above thresholds for testing threshold increase.
+        // Choose times around the threshold to test its increase.
         //
-        //```
+        // ```
         //              between_thresh_ms
         //                         |
         //    initial_thresh_ms    |     spurious_thresh_ms
@@ -1494,7 +1502,7 @@ mod tests {
         //      | ................ | ..................... |
         //            THRESH_GAP         THRESH_GAP
         // ```
-        // 
+        //
         // Threshold gap time.
         const THRESH_GAP: Duration = Duration::from_millis(30);
         // Initial time theshold based on inital RTT.
@@ -1644,8 +1652,8 @@ mod tests {
         );
     }
 
-    // TODO: Implement enable_relaxed_loss_threshold and enable this test for the
-    // congestion module.
+    // TODO: Implement `enable_relaxed_loss_threshold` and enable this test for
+    // the congestion module.
     #[rstest]
     fn relaxed_thresholds_on_reordering(
         #[values("bbr2_gcongestion")] cc_algorithm_name: &str,
@@ -1658,9 +1666,9 @@ mod tests {
         let mut r = Recovery::new(&cfg);
         assert_eq!(r.rtt(), DEFAULT_INITIAL_RTT);
 
-        // Pick time between and above thresholds for testing threshold increase.
+        // Choose times around the threshold to test its increase.
         //
-        //```
+        // ```
         //              between_thresh_ms
         //                         |
         //    initial_thresh_ms    |     spurious_thresh_ms
@@ -2755,6 +2763,319 @@ mod tests {
                 "{iter}"
             );
         }
+    }
+    #[rstest]
+    fn pto_overflow_reproduction(
+        #[values("reno", "cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+    ) {
+        let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        assert_eq!(cfg.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
+        let mut r = Recovery::new(&cfg);
+        let now = Instant::now();
+
+        // Scenario: Handshake not completed
+        let handshake_status = HandshakeStatus {
+            has_handshake_keys: true,
+            peer_verified_address: true,
+            completed: false,
+        };
+
+        // 1. Send Initial packet to arm the timer
+        let p_initial = Sent {
+            pkt_num: 0,
+            frames: smallvec::smallvec![],
+            time_sent: now,
+            time_acked: None,
+            time_lost: None,
+            size: 1000,
+            ack_eliciting: true,
+            in_flight: true,
+            delivered: 0,
+            delivered_time: now,
+            first_sent_time: now,
+            is_app_limited: false,
+            tx_in_flight: 0,
+            lost: 0,
+            has_data: false,
+            is_pmtud_probe: false,
+        };
+        r.on_packet_sent(
+            p_initial,
+            packet::Epoch::Initial,
+            handshake_status,
+            now,
+            "",
+        );
+
+        // The timer should now be set for the Initial packet.
+        assert!(r.loss_detection_timer().is_some());
+
+        // 2. Send Application packet (0-RTT)
+        let p_app = Sent {
+            pkt_num: 0, // Application space has its own packet numbers
+            frames: smallvec::smallvec![],
+            time_sent: now,
+            time_acked: None,
+            time_lost: None,
+            size: 1000,
+            ack_eliciting: true,
+            in_flight: true,
+            delivered: 0,
+            delivered_time: now,
+            first_sent_time: now,
+            is_app_limited: false,
+            tx_in_flight: 0,
+
+            lost: 0,
+            has_data: true,
+            is_pmtud_probe: false,
+        };
+        r.on_packet_sent(
+            p_app,
+            packet::Epoch::Application,
+            handshake_status,
+            now,
+            "",
+        );
+
+        // 3. Acknowledge the Initial packet.
+        // This empties the Initial space, but Application space still has data
+        // in flight.
+        let mut ranges = RangeSet::default();
+        ranges.insert(0..1);
+        r.on_ack_received(
+            &ranges,
+            0,
+            packet::Epoch::Initial,
+            handshake_status,
+            now,
+            None,
+            "",
+        )
+        .unwrap();
+
+        // The timer should be cleared at this point.
+        // Although there is Application data in flight, the handshake is not
+        // confirmed, so it cannot be used to arm the PTO timer. Since there are
+        // no packets in flight in Initial or Handshake spaces either, no timer
+        // should be set.
+        assert!(r.loss_detection_timer().is_none());
+    }
+
+    // Test that consecutive PTOs don't add duplicate frames to lost_frames.
+    // This validates the fix: `if epoch.lost_frames.is_empty()` guard.
+    #[rstest]
+    fn pto_does_not_duplicate_frames_on_consecutive_timeouts(
+        #[values("reno", "cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+    ) {
+        let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        assert_eq!(cfg.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
+
+        let mut r = Recovery::new(&cfg);
+        let mut now = Instant::now();
+
+        // Send a packet with a STREAM frame.
+        let frames = smallvec![frame::Frame::Stream {
+            stream_id: 4,
+            data: RangeBuf::from(b"test", 0, false),
+        },];
+
+        let p = Sent {
+            pkt_num: 0,
+            frames: frames.clone(),
+            time_sent: now,
+            time_acked: None,
+            time_lost: None,
+            size: 1000,
+            ack_eliciting: true,
+            in_flight: true,
+            delivered: 0,
+            delivered_time: now,
+            first_sent_time: now,
+            is_app_limited: false,
+            tx_in_flight: 0,
+            lost: 0,
+            has_data: true,
+            is_pmtud_probe: false,
+        };
+
+        r.on_packet_sent(
+            p,
+            packet::Epoch::Application,
+            HandshakeStatus::default(),
+            now,
+            "",
+        );
+
+        // Verify initial state
+        assert_eq!(r.lost_frames_count(packet::Epoch::Application), 0);
+        assert_eq!(r.lost_count(), 0);
+
+        // First PTO - should add frames when lost_frames is empty.
+        now = r.loss_detection_timer().unwrap();
+        r.on_loss_detection_timeout(HandshakeStatus::default(), now, "");
+
+        assert_eq!(r.pto_count(), 1);
+        let frames_after_first_pto =
+            r.lost_frames_count(packet::Epoch::Application);
+        assert_eq!(
+            frames_after_first_pto, 1,
+            "First PTO should add exactly 1 frame"
+        );
+        assert_eq!(
+            r.lost_count(),
+            0,
+            "PTO doesn't declare packets lost (no CC impact)"
+        );
+
+        // Second PTO while lost_frames is still populated.
+        // WITHOUT the fix: would add duplicate frame (count becomes 2).
+        // WITH the fix: skips adding (count stays 1).
+        now = r.loss_detection_timer().unwrap();
+        r.on_loss_detection_timeout(HandshakeStatus::default(), now, "");
+
+        assert_eq!(r.pto_count(), 2);
+        let frames_after_second_pto =
+            r.lost_frames_count(packet::Epoch::Application);
+        assert_eq!(
+            frames_after_second_pto, frames_after_first_pto,
+            "Second PTO must NOT add duplicate frames (fix: `if \
+             lost_frames.is_empty()`)"
+        );
+
+        // Third PTO for extra validation
+        now = r.loss_detection_timer().unwrap();
+        r.on_loss_detection_timeout(HandshakeStatus::default(), now, "");
+
+        assert_eq!(r.pto_count(), 3);
+        let frames_after_third_pto =
+            r.lost_frames_count(packet::Epoch::Application);
+        assert_eq!(
+            frames_after_third_pto, frames_after_first_pto,
+            "Third PTO must NOT add duplicate frames"
+        );
+
+        // Verify packets are still tracked (not removed)
+        assert_eq!(r.sent_packets_len(packet::Epoch::Application), 1);
+        // Verify lost_count never increased (PTO doesn't trigger CC)
+        assert_eq!(r.lost_count(), 0);
+    }
+
+    // Test that send_on_path after PTO timeout properly sends retransmissions
+    // and doesn't mark packets as lost (lost_count should remain 0).
+    #[rstest]
+    fn pto_send_on_path_retransmits_without_loss(
+        #[values("reno", "cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+    ) {
+        use crate::test_utils;
+
+        let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+
+        // Complete handshake
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        // Client sends stream data
+        assert_eq!(pipe.client.stream_send(4, b"hello", false), Ok(5));
+
+        let mut buf = [0; 65535];
+
+        // Send the packet but drop it (don't deliver to server)
+        let (len1, _) = pipe.client.send(&mut buf).unwrap();
+        assert!(len1 > 0);
+
+        // Verify lost_count is 0 (no losses yet)
+        let initial_lost_count = pipe
+            .client
+            .paths
+            .get_active()
+            .unwrap()
+            .recovery
+            .lost_count();
+        assert_eq!(initial_lost_count, 0, "No packets should be lost initially");
+
+        // Verify frames are not yet in lost_frames
+        let initial_lost_frames = pipe
+            .client
+            .paths
+            .get_active()
+            .unwrap()
+            .recovery
+            .lost_frames_count(packet::Epoch::Application);
+        assert_eq!(
+            initial_lost_frames, 0,
+            "No frames should be in lost_frames initially"
+        );
+
+        // Wait for PTO timeout
+        let timer = pipe.client.timeout().unwrap();
+        std::thread::sleep(timer + Duration::from_millis(1));
+
+        // Trigger PTO via on_timeout()
+        pipe.client.on_timeout();
+
+        // After PTO, frames should be in lost_frames for retransmission
+        let lost_frames_after_pto = pipe
+            .client
+            .paths
+            .get_active()
+            .unwrap()
+            .recovery
+            .lost_frames_count(packet::Epoch::Application);
+        assert!(
+            lost_frames_after_pto > 0,
+            "PTO should add frames to lost_frames for retransmission"
+        );
+
+        // But lost_count should still be 0 (PTO doesn't declare packets lost)
+        let lost_count_after_pto = pipe
+            .client
+            .paths
+            .get_active()
+            .unwrap()
+            .recovery
+            .lost_count();
+        assert_eq!(
+            lost_count_after_pto, 0,
+            "PTO should not increment lost_count"
+        );
+
+        // Now send the retransmission via send_on_path
+        let (len2, _) = pipe.client.send(&mut buf).unwrap();
+        assert!(len2 > 0, "Should send PTO probe packet");
+
+        // After sending, lost_count should still be 0
+        let lost_count_after_send = pipe
+            .client
+            .paths
+            .get_active()
+            .unwrap()
+            .recovery
+            .lost_count();
+        assert_eq!(
+            lost_count_after_send, 0,
+            "Sending PTO probe should not increment lost_count"
+        );
+
+        // Deliver the retransmission to server
+        assert_eq!(pipe.server_recv(&mut buf[..len2]), Ok(len2));
+
+        // Server should receive the stream data
+        let mut recv_buf = [0; 100];
+        assert_eq!(pipe.server.stream_recv(4, &mut recv_buf), Ok((5, false)));
+        assert_eq!(&recv_buf[..5], b"hello");
+
+        // Final verification: lost_count on client should still be 0
+        let final_lost_count = pipe
+            .client
+            .paths
+            .get_active()
+            .unwrap()
+            .recovery
+            .lost_count();
+        assert_eq!(
+            final_lost_count, 0,
+            "No packets should be marked as lost - PTO only retransmits"
+        );
     }
 }
 

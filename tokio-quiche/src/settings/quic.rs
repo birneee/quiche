@@ -29,6 +29,8 @@ use serde_with::serde_as;
 use serde_with::DurationMilliSeconds;
 use std::time::Duration;
 
+pub use qlog::writer::QlogCompression;
+
 /// QUIC configuration parameters.
 #[serde_as]
 #[settings]
@@ -152,6 +154,16 @@ pub struct QuicSettings {
     /// Path to a directory where QLOG files will be saved.
     pub qlog_dir: Option<String>,
 
+    /// Compression applied to QLOG output files.
+    ///
+    /// Defaults to [`QlogCompression::None`], preserving the historical
+    /// behavior of emitting raw `.sqlog` files. The `Gzip` and `Zstd`
+    /// variants require the `qlog-gzip` and `qlog-zstd` Cargo features
+    /// (both enabled by default); builds that disable those features
+    /// cannot reference the corresponding variant.
+    #[serde(default)]
+    pub qlog_compression: QlogCompression,
+
     /// Congestion control algorithm to use.
     ///
     /// For available values, see
@@ -258,6 +270,14 @@ pub struct QuicSettings {
     #[serde(default = "QuicSettings::default_max_stream_window")]
     pub max_stream_window: u64,
 
+    /// Deprecated: this is now always enabled and this setting is
+    /// ignored.
+    ///
+    /// Previously controlled whether to use the `initial_max_data`
+    /// transport parameter as the initial connection and stream flow
+    /// control window.
+    pub use_initial_max_data_as_fc_window: bool,
+
     /// If true, send an advisory STREAMS_BLOCKED frame when the
     /// application's local stream creation attempts fail due to the
     /// peer advertised MAX_STREAMS limit.
@@ -330,6 +350,20 @@ pub struct QuicSettings {
     ///
     /// [`enable_track_unknown_transport_parameters()`]: https://docs.rs/quiche/latest/quiche/struct.Config.html#method.enable_track_unknown_transport_parameters
     pub track_unknown_transport_parameters: Option<usize>,
+
+    /// Configures whether the IO worker borrows its egress scratch buffer from
+    /// a per-worker-thread pool that is shared across connections, instead of
+    /// holding a persistent buffer for each connection's entire lifetime.
+    ///
+    /// Pooling stops idle connections from pinning a large egress buffer, which
+    /// reduces steady-state heap usage when many connections are idle. Setting
+    /// this to `false` restores the previous behavior of a persistent
+    /// per-connection buffer (owned by the IO worker), which is useful as a
+    /// runtime fallback.
+    ///
+    /// Defaults to `true`.
+    #[serde(default = "QuicSettings::default_pool_send_buffer")]
+    pub pool_send_buffer: bool,
 }
 
 impl QuicSettings {
@@ -343,6 +377,11 @@ impl QuicSettings {
 
     #[inline]
     fn default_enable_dgram() -> bool {
+        true
+    }
+
+    #[inline]
+    fn default_pool_send_buffer() -> bool {
         true
     }
 
@@ -403,10 +442,9 @@ impl QuicSettings {
 
     #[inline]
     fn default_listen_backlog() -> usize {
-        // Given a worst-case 1 minute handshake timeout and up to 4096 concurrent
-        // handshakes, we will dequeue at least 70 connections per second.
-        // This means this backlog size limits the queueing latency to
-        // ~15s.
+        // With a worst-case one-minute timeout and 4096 concurrent handshakes,
+        // at least 70 connections are dequeued per second. A backlog of 1024
+        // therefore limits queueing latency to about 15 seconds.
         1024
     }
 
