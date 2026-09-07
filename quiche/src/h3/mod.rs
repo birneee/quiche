@@ -3515,14 +3515,15 @@ impl Connection {
     }
 
     /// Frees `stream_id`'s H3 state once closed (both directions for bidi,
-    /// the local direction for uni).
+    /// the local direction for uni) and fully drained.
     fn collect_webtransport_stream_if_closed<F: BufFactory>(
         &mut self, conn: &super::Connection<F>, stream_id: u64,
     ) {
         let ty = self.streams.get(&stream_id).map(stream::Stream::ty);
 
         if ty == Some(Some(stream::Type::WebTransport)) &&
-            conn.stream_closed(stream_id)
+            conn.stream_closed(stream_id) &&
+            !conn.stream_readable(stream_id)
         {
             self.streams.remove(&stream_id);
         }
@@ -8870,6 +8871,68 @@ mod tests {
 
         // Reading through the fin collects the receiving end too.
         assert_eq!(s.server.streams.len(), init_streams_server);
+    }
+
+    /// A peer reset (bypassing h3) can leave a stream readable (the reset
+    /// itself unread) exactly when our own close makes `stream_closed()`
+    /// true. Must not collect until also drained, or
+    /// `readable_webtransport_streams()` panics on, or silently drops, the
+    /// still-unread reset.
+    #[test]
+    fn webtransport_stream_readable_survives_close_until_drained() {
+        let mut s = webtransport_session();
+
+        let stream_id = s
+            .client
+            .open_webtransport_stream(&mut s.pipe.client, true)
+            .unwrap();
+        s.client
+            .send_webtransport_stream(
+                &mut s.pipe.client,
+                stream_id,
+                b"hello",
+                false,
+            )
+            .unwrap();
+        s.advance().ok();
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        // Client resets its send side instead of a clean fin.
+        s.pipe
+            .client
+            .stream_shutdown(stream_id, crate::Shutdown::Write, 42)
+            .unwrap();
+        s.advance().ok();
+        assert!(s.pipe.server.stream_readable(stream_id));
+
+        // Server's own close makes `stream_closed()` true, but the reset
+        // above is still unread.
+        let sent = s.server.send_webtransport_stream(
+            &mut s.pipe.server,
+            stream_id,
+            b"",
+            true,
+        );
+        assert_eq!(sent, Ok(0));
+        assert!(s.pipe.server.stream_closed(stream_id));
+        assert!(s.pipe.server.stream_readable(stream_id));
+        assert!(s.server.streams.contains_key(&stream_id));
+
+        // Must not panic, and must still surface the stream.
+        let mut readable = s.server.readable_webtransport_streams(&s.pipe.server);
+        assert_eq!(readable.next(), Some(stream_id));
+
+        // Reading delivers the reset; only now is it collected.
+        let recvd = s.server.recv_webtransport_stream(
+            &mut s.pipe.server,
+            stream_id,
+            &mut [0; 5],
+        );
+        assert_eq!(
+            recvd,
+            Err(Error::TransportError(crate::Error::StreamReset(42)))
+        );
+        assert!(!s.server.streams.contains_key(&stream_id));
     }
 }
 
