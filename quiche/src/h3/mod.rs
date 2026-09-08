@@ -1255,7 +1255,8 @@ impl Connection {
                 HDR_LEN,
             )?;
 
-            conn.stream_send(stream_id, &[], false)?; // only to create stream state
+            // only to create stream state
+            conn.stream_send(stream_id, &[], false)?;
             if conn.stream_capacity(stream_id)? < HDR_LEN {
                 return Err(Error::StreamBlocked);
             }
@@ -1272,8 +1273,9 @@ impl Connection {
             stream.set_frame_type(frame::WEBTRANSPORT_STREAM_FRAME_TYPE_ID)?;
             self.streams.insert(stream_id, stream);
 
-            // To avoid skipping stream IDs, we only calculate the next available
-            // stream ID when a request has been successfully buffered.
+            // To avoid skipping stream IDs, we only calculate the next
+            // available stream ID when a request has been
+            // successfully buffered.
             self.next_request_stream_id = self
                 .next_request_stream_id
                 .checked_add(4)
@@ -1290,7 +1292,8 @@ impl Connection {
                 HDR_LEN,
             )?;
 
-            conn.stream_send(stream_id, &[], false)?; // only to create stream state
+            conn.stream_send(stream_id, &[], false)?; // only to create stream
+                                                      // state
             if conn.stream_capacity(stream_id)? < HDR_LEN {
                 return Err(Error::StreamBlocked);
             }
@@ -1307,8 +1310,9 @@ impl Connection {
             stream.set_ty(stream::Type::WebTransport)?;
             self.streams.insert(stream_id, stream);
 
-            // To avoid skipping stream IDs, we only calculate the next available
-            // stream ID when a request has been successfully buffered.
+            // To avoid skipping stream IDs, we only calculate the next
+            // available stream ID when a request has been
+            // successfully buffered.
             self.next_uni_stream_id = self
                 .next_uni_stream_id
                 .checked_add(4)

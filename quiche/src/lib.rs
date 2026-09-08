@@ -8925,8 +8925,8 @@ impl<F: BufFactory> Connection<F> {
         // Enter the app-limited phase of delivery rate when these conditions
         // are met:
         //
-        // - The remaining capacity exceeds the available bytes in CWND (there is
-        //   more room to send).
+        // - The remaining capacity exceeds the available bytes in CWND (there
+        //   is more room to send).
         // - New data since the last `send()` is smaller than available bytes in
         //   CWND (we queued less than what we can send).
         // - CWND has room for more data.
