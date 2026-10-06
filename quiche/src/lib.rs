@@ -4564,12 +4564,24 @@ impl<F: BufFactory> Connection<F> {
             }
         }
 
-        // Limit output packet size by congestion window size.
-        left = cmp::min(
-            left,
-            // Bytes consumed by ACK frames.
-            cwnd_available.saturating_sub(left_before_packing_ack_frame - left),
-        );
+        // Limit output packet size by congestion window size, except for a
+        // packet that will carry a PATH_CHALLENGE: its datagram must be
+        // expanded to at least 1200 bytes to validate the path MTU (RFC 9000
+        // Section 8.2.1), which only the anti-amplification limit, applied in
+        // send_on_path(), may prevent. Capped by the congestion window, a
+        // challenge on a busy path stays small, and the path can never leave
+        // the ValidatingMTU state.
+        let path_challenge_pending =
+            pkt_type == Type::Short && path.validation_requested();
+
+        if !path_challenge_pending {
+            left = cmp::min(
+                left,
+                // Bytes consumed by ACK frames.
+                cwnd_available
+                    .saturating_sub(left_before_packing_ack_frame - left),
+            );
+        }
 
         let mut challenge_data = None;
 
