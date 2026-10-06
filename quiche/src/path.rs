@@ -508,9 +508,14 @@ impl Path {
             };
             // As a server, if requesting a challenge is not
             // possible due to the amplification attack, declare the
-            // validation as failed.
+            // validation as failed. Once the peer's address is verified the
+            // amplification limit no longer applies, and `max_send_bytes`
+            // is no longer credited while still being debited on every
+            // send, so it says nothing about whether a challenge can be sent.
             if self.probing_lost >= crate::MAX_PROBING_TIMEOUTS ||
-                (is_server && self.max_send_bytes < crate::MIN_PROBING_SIZE)
+                (is_server &&
+                    !self.verified_peer_address &&
+                    self.max_send_bytes < crate::MIN_PROBING_SIZE)
             {
                 self.on_failed_validation();
             } else {
