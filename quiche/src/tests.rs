@@ -10679,6 +10679,107 @@ fn lost_probe_on_verified_path_with_drained_amplification_budget(
 }
 
 #[rstest]
+fn path_challenge_padded_with_full_cwnd(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+    assert_eq!(config.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
+    config
+        .load_cert_chain_from_pem_file("examples/cert.crt")
+        .unwrap();
+    config
+        .load_priv_key_from_pem_file("examples/cert.key")
+        .unwrap();
+    config
+        .set_application_protos(&[b"proto1", b"proto2"])
+        .unwrap();
+    config.verify_peer(false);
+    config.set_active_connection_id_limit(2);
+    config.set_initial_max_data(1_000_000);
+    config.set_initial_max_stream_data_bidi_local(1_000_000);
+    config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    config.set_initial_max_streams_bidi(3);
+
+    let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr = test_utils::Pipe::client_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+    // A NAT rebinding: the client doesn't know its address changed, the NAT
+    // rewrites it to client_addr_2 towards the server and back towards the
+    // client.
+    let nat_out = |mut flight: Vec<(Vec<u8>, SendInfo)>| {
+        flight
+            .iter_mut()
+            .for_each(|(_, si)| si.from = client_addr_2);
+        flight
+    };
+    let nat_in = |mut flight: Vec<(Vec<u8>, SendInfo)>| {
+        flight.iter_mut().for_each(|(_, si)| si.to = client_addr);
+        flight
+    };
+
+    // A tiny packet from the new address: the server's first PATH_CHALLENGE
+    // on it is limited by the anti-amplification limit, too small to validate
+    // the path MTU. Hold it back for now.
+    assert_eq!(pipe.client.stream_send(0, b"a", false), Ok(1));
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, nat_out(flight)).unwrap();
+    let challenge_flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    assert!(challenge_flight
+        .iter()
+        .all(|(p, _)| p.len() < MIN_CLIENT_INITIAL_LEN));
+
+    // The client keeps sending, lifting the amplification budget, and the
+    // server fills its congestion window with data that isn't acked yet.
+    let data = [0; 12_000];
+    assert!(pipe.client.stream_send(0, &data, false).is_ok());
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, nat_out(flight)).unwrap();
+    // Only the server's own data stays unacked: the client gets its ACKs.
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    test_utils::process_flight(&mut pipe.client, nat_in(flight)).unwrap();
+    let data = [0; 100_000];
+    assert!(pipe.server.stream_send(0, &data, false).is_ok());
+    let _unacked = test_utils::emit_flight(&mut pipe.server).unwrap();
+
+    // The PATH_RESPONSE verifies the address, but the path MTU is not
+    // validated yet, so the server wants to send another PATH_CHALLENGE.
+    test_utils::process_flight(&mut pipe.client, nat_in(challenge_flight))
+        .unwrap();
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, nat_out(flight)).unwrap();
+
+    let pid = pipe
+        .server
+        .paths
+        .path_id_from_addrs(&(server_addr, client_addr_2))
+        .unwrap();
+    let path = pipe.server.paths.get(pid).unwrap();
+    assert!(path.verified_peer_address);
+    assert!(!path.validated());
+    assert!(path.probing_required());
+    assert!(path.recovery.cwnd_available() < MIN_CLIENT_INITIAL_LEN);
+
+    // Despite the full congestion window, the PATH_CHALLENGE goes out in a
+    // datagram expanded to at least 1200 bytes, and validates the path.
+    let mut buf = [0; 65535];
+    let (len, info) = pipe.server.send(&mut buf).unwrap();
+    assert!(len >= MIN_CLIENT_INITIAL_LEN);
+    assert!(!pipe.server.paths.get(pid).unwrap().probing_required());
+
+    let flight = vec![(buf[..len].to_vec(), info)];
+    test_utils::process_flight(&mut pipe.client, nat_in(flight)).unwrap();
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, nat_out(flight)).unwrap();
+    assert_eq!(
+        pipe.server.is_path_validated(server_addr, client_addr_2),
+        Ok(true)
+    );
+}
+
+#[rstest]
 fn client_discard_unknown_address(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
 ) {
