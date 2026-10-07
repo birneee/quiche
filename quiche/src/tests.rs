@@ -10780,6 +10780,64 @@ fn path_challenge_padded_with_full_cwnd(
 }
 
 #[rstest]
+fn max_congestion_window(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let new_config = |initial_cwnd_packets: usize| {
+        let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+        assert_eq!(config.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.verify_peer(false);
+        config.set_max_send_udp_payload_size(1200);
+        config.set_initial_congestion_window_packets(initial_cwnd_packets);
+        config.set_max_congestion_window_packets(20);
+        config.set_initial_max_data(10_000_000);
+        config.set_initial_max_stream_data_bidi_local(10_000_000);
+        config.set_initial_max_stream_data_bidi_remote(10_000_000);
+        config.set_initial_max_streams_bidi(3);
+        config
+    };
+    let max = 20 * 1200;
+
+    // An initial window above the maximum is capped too.
+    let mut pipe = test_utils::Pipe::with_config(&mut new_config(30)).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert!(pipe.server.paths.get_active().unwrap().recovery.cwnd() <= max);
+
+    // A bulk transfer grows the window from the default, but never beyond the
+    // maximum.
+    let mut pipe = test_utils::Pipe::with_config(&mut new_config(10)).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert_eq!(pipe.client.stream_send(0, b"a", false), Ok(1));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    // More per round than the window, so it's never app-limited.
+    let data = [0; 100_000];
+    let mut reached = false;
+    for _ in 0..50 {
+        let _ = pipe.server.stream_send(0, &data, false);
+        assert_eq!(pipe.advance(), Ok(()));
+        let cwnd = pipe.server.paths.get_active().unwrap().recovery.cwnd();
+        assert!(cwnd <= max, "cwnd {cwnd} exceeds the maximum {max}");
+        reached |= cwnd == max;
+    }
+    // BBRv2 sizes its window from a bandwidth-delay estimate that the
+    // near-zero RTT of the in-memory pipe keeps small; cubic grows on every
+    // ACK, so it must actually hit the limit.
+    if cc_algorithm_name == "cubic" {
+        assert!(reached, "the window never grew to the maximum");
+    }
+}
+
+#[rstest]
 fn client_discard_unknown_address(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
 ) {
