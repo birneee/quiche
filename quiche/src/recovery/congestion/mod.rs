@@ -24,6 +24,7 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::cmp;
 use std::time::Instant;
 
 use self::recovery::Acked;
@@ -113,6 +114,10 @@ pub struct Congestion {
     /// Initial congestion window size in terms of packet count.
     pub(crate) initial_congestion_window_packets: usize,
 
+    /// Upper limit for `congestion_window` in bytes, if any. See
+    /// `Config::set_max_congestion_window_packets()`.
+    max_congestion_window: Option<usize>,
+
     max_datagram_size: usize,
 
     pub(crate) lost_count: usize,
@@ -147,6 +152,10 @@ impl Congestion {
             initial_congestion_window_packets: recovery_config
                 .initial_congestion_window_packets,
 
+            max_congestion_window: recovery_config
+                .max_congestion_window_packets
+                .map(|p| p * recovery_config.max_send_udp_payload_size),
+
             max_datagram_size: recovery_config.max_send_udp_payload_size,
 
             send_quantum: initial_congestion_window,
@@ -162,8 +171,19 @@ impl Congestion {
         };
 
         (cc.cc_ops.on_init)(&mut cc);
+        cc.limit_congestion_window();
 
         cc
+    }
+
+    /// Clamps `congestion_window` to `max_congestion_window`. The window only
+    /// grows on init, on ACKs and on a path MTU update, so clamping after those
+    /// keeps the stored value, which loss reactions scale down from, within
+    /// the limit.
+    pub(crate) fn limit_congestion_window(&mut self) {
+        if let Some(max) = self.max_congestion_window {
+            self.congestion_window = cmp::min(self.congestion_window, max);
+        }
     }
 
     pub(crate) fn in_congestion_recovery(&self, sent_time: Instant) -> bool {
@@ -241,6 +261,7 @@ impl Congestion {
             now,
             rtt_stats,
         );
+        self.limit_congestion_window();
     }
 }
 
