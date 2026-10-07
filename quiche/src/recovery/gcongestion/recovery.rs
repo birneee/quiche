@@ -5,6 +5,7 @@ use crate::recovery::TIME_THRESHOLD_OVERHEAD_MULTIPLIER;
 use crate::Error;
 use crate::Result;
 
+use std::cmp;
 use std::collections::VecDeque;
 use std::time::Duration;
 use std::time::Instant;
@@ -513,9 +514,18 @@ impl GRecovery {
 
     pub fn new(recovery_config: &RecoveryConfig) -> Option<Self> {
         let cc = match recovery_config.cc_algorithm {
+            // BBRv2 also uses the initial window as its lower limit, so a
+            // maximum below it caps the initial window too.
             CongestionControlAlgorithm::Bbr2Gcongestion => BBRv2::new(
-                recovery_config.initial_congestion_window_packets,
-                MAX_WINDOW_PACKETS,
+                cmp::min(
+                    recovery_config.initial_congestion_window_packets,
+                    recovery_config
+                        .max_congestion_window_packets
+                        .unwrap_or(MAX_WINDOW_PACKETS),
+                ),
+                recovery_config
+                    .max_congestion_window_packets
+                    .unwrap_or(MAX_WINDOW_PACKETS),
                 recovery_config.max_send_udp_payload_size,
                 recovery_config.initial_rtt,
                 recovery_config.custom_bbr_params.as_ref(),

@@ -951,6 +951,7 @@ impl RecoveryOps for LegacyRecovery {
         {
             self.congestion.congestion_window = new_max_datagram_size *
                 self.congestion.initial_congestion_window_packets;
+            self.congestion.limit_congestion_window();
         }
 
         self.max_datagram_size = new_max_datagram_size;
