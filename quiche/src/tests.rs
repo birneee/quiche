@@ -11574,6 +11574,76 @@ fn connection_migration_reordered_non_probing(
 }
 
 #[rstest]
+fn ack_only_packet_on_unvalidated_path_not_padded(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+    assert_eq!(config.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
+    config
+        .load_cert_chain_from_pem_file("examples/cert.crt")
+        .unwrap();
+    config
+        .load_priv_key_from_pem_file("examples/cert.key")
+        .unwrap();
+    config
+        .set_application_protos(&[b"proto1", b"proto2"])
+        .unwrap();
+    config.verify_peer(false);
+    config.set_active_connection_id_limit(2);
+    config.set_initial_max_data(100000);
+    config.set_initial_max_stream_data_bidi_local(100000);
+    config.set_initial_max_stream_data_bidi_remote(100000);
+    config.set_initial_max_streams_bidi(2);
+
+    let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+    // NAT rebinding: the client's packets now arrive from a new address,
+    // enough of them for the anti-amplification limit to allow a 1200-byte
+    // datagram.
+    assert_eq!(pipe.client.stream_send(0, &[42; 1000], false), Ok(1000));
+    let mut flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    flight
+        .iter_mut()
+        .for_each(|(_, si)| si.from = client_addr_2);
+    assert_eq!(test_utils::process_flight(&mut pipe.server, flight), Ok(()));
+    assert_eq!(
+        pipe.server.is_path_validated(server_addr, client_addr_2),
+        Ok(false)
+    );
+
+    // The datagram with the PATH_CHALLENGE is expanded (and then lost).
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    assert!(flight
+        .iter()
+        .any(|(pkt, _)| pkt.len() >= MIN_CLIENT_INITIAL_LEN));
+
+    // More data from the new address, while it's still unvalidated: the
+    // server's ACK-only packet isn't padded.
+    assert_eq!(pipe.client.stream_send(0, b"b", false), Ok(1));
+    let mut flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    flight
+        .iter_mut()
+        .for_each(|(_, si)| si.from = client_addr_2);
+    assert_eq!(test_utils::process_flight(&mut pipe.server, flight), Ok(()));
+
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    assert_eq!(flight.len(), 1);
+    assert_eq!(flight[0].1.to, client_addr_2);
+    assert!(
+        flight[0].0.len() < 100,
+        "ACK padded to {}",
+        flight[0].0.len()
+    );
+    assert_eq!(
+        pipe.server.is_path_validated(server_addr, client_addr_2),
+        Ok(false)
+    );
+}
+
+#[rstest]
 fn resilience_against_migration_attack(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
 ) {
