@@ -476,9 +476,15 @@ impl Path {
             trace_id,
         );
 
+        // A challenge is only lost once it went unanswered for a PTO. This
+        // timeout also runs for time-threshold loss detection of any other
+        // packet on the path, which on a lossy, busy path fires every RTT or
+        // so: counting every challenge in flight as lost there, however young,
+        // fails a path whose challenges are being answered.
+        let pto = self.recovery.pto();
         let mut lost_probe_time = None;
         self.in_flight_challenges.retain(|(_, _, sent_time)| {
-            if *sent_time <= now {
+            if *sent_time + pto <= now {
                 if lost_probe_time.is_none() {
                     lost_probe_time = Some(*sent_time);
                 }
@@ -1072,6 +1078,62 @@ mod tests {
     use crate::Config;
 
     use super::*;
+
+    #[test]
+    fn young_challenge_not_lost_on_loss_detection_timeout() {
+        let client_addr = "127.0.0.1:1234".parse().unwrap();
+        let server_addr = "127.0.0.1:4321".parse().unwrap();
+
+        let config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        let recovery_config = RecoveryConfig::from_config(&config);
+
+        let mut path = Path::new(
+            server_addr,
+            client_addr,
+            &recovery_config,
+            config.path_challenge_recv_max_queue_len,
+            false,
+            None,
+        );
+        // The peer's address is verified; only the path MTU isn't yet.
+        path.verified_peer_address = true;
+        let handshake_status = HandshakeStatus {
+            has_handshake_keys: true,
+            peer_verified_address: true,
+            completed: true,
+        };
+
+        // On a busy, lossy path the loss detection timer also fires for
+        // time-threshold loss detection of data, every RTT or so, often just
+        // after a PATH_CHALLENGE was sent. Such a challenge is too young to be
+        // lost: it stays in flight, and no probe loss is counted.
+        let mut now = Instant::now();
+        for i in 0..crate::MAX_PROBING_TIMEOUTS {
+            let data = [i as u8; 8];
+            path.add_challenge_sent(data, 1200, now);
+            path.on_loss_detection_timeout(
+                handshake_status,
+                now + Duration::from_millis(10),
+                true,
+                "",
+            );
+            assert!(path.has_pending_challenge(data));
+            assert_eq!(path.probing_lost, 0);
+            assert!(!path.validation_failed());
+
+            // Answered before it could be lost.
+            path.on_response_received(data);
+            now += Duration::from_millis(50);
+        }
+
+        // A challenge unanswered for a PTO is still lost.
+        let data = [0xff; 8];
+        path.add_challenge_sent(data, 1200, now);
+        let pto = path.recovery.pto();
+        path.on_loss_detection_timeout(handshake_status, now + pto, true, "");
+        assert!(!path.has_pending_challenge(data));
+        assert_eq!(path.probing_lost, 1);
+    }
 
     #[test]
     fn path_validation_limited_mtu() {
