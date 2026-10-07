@@ -5327,8 +5327,20 @@ impl<F: BufFactory> Connection<F> {
         // 1) an Initial packet has already been written to the UDP datagram,
         // as Initial always requires padding.
         //
-        // 2) this is a probing packet towards an unvalidated peer address.
-        if (has_initial || !path.validated()) &&
+        // 2) this packet carries a PATH_CHALLENGE or PATH_RESPONSE frame, whose
+        // datagrams must be expanded to 1200 bytes (RFC 9000, Sections 8.2.1
+        // and 8.2.2). Other packets, e.g. ACK-only packets, are not padded
+        // just because the path is unvalidated: that only costs return path
+        // capacity and anti-amplification budget.
+        let has_path_validation_frame = frames.iter().any(|f| {
+            matches!(
+                f,
+                frame::Frame::PathChallenge { .. } |
+                    frame::Frame::PathResponse { .. }
+            )
+        });
+
+        if (has_initial || has_path_validation_frame) &&
             pkt_type == Type::Short &&
             left >= 1
         {
