@@ -139,6 +139,7 @@ pub struct RecoveryConfig {
     pub pacing: bool,
     pub max_pacing_rate: Option<u64>,
     pub initial_congestion_window_packets: usize,
+    pub max_congestion_window_packets: Option<usize>,
     pub enable_relaxed_loss_threshold: bool,
     pub enable_cubic_idle_restart_fix: bool,
 }
@@ -156,6 +157,7 @@ impl RecoveryConfig {
             max_pacing_rate: config.max_pacing_rate,
             initial_congestion_window_packets: config
                 .initial_congestion_window_packets,
+            max_congestion_window_packets: config.max_congestion_window_packets,
             enable_relaxed_loss_threshold: config.enable_relaxed_loss_threshold,
             enable_cubic_idle_restart_fix: config.enable_cubic_idle_restart_fix,
         }

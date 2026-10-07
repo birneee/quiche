@@ -573,6 +573,7 @@ pub struct Config {
     cc_algorithm: CongestionControlAlgorithm,
     custom_bbr_params: Option<BbrParams>,
     initial_congestion_window_packets: usize,
+    max_congestion_window_packets: Option<usize>,
     enable_relaxed_loss_threshold: bool,
     enable_cubic_idle_restart_fix: bool,
     enable_send_streams_blocked: bool,
@@ -655,6 +656,7 @@ impl Config {
             custom_bbr_params: None,
             initial_congestion_window_packets:
                 DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS,
+            max_congestion_window_packets: None,
             enable_relaxed_loss_threshold: false,
             enable_cubic_idle_restart_fix: true,
             enable_send_streams_blocked: false,
@@ -1119,6 +1121,18 @@ impl Config {
     /// The default value is 10.
     pub fn set_initial_congestion_window_packets(&mut self, packets: usize) {
         self.initial_congestion_window_packets = packets;
+    }
+
+    /// Sets an upper limit for the congestion window in terms of packet
+    /// count, packets being of the maximum send UDP payload size.
+    ///
+    /// The congestion controller never grows the window beyond it, which
+    /// bounds the data in flight, e.g. to what a path with a known capacity
+    /// and queue can hold. It also caps the initial window.
+    ///
+    /// The default is no limit.
+    pub fn set_max_congestion_window_packets(&mut self, packets: usize) {
+        self.max_congestion_window_packets = Some(packets);
     }
 
     /// Configure whether to enable relaxed loss detection on spurious loss.
