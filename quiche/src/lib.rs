@@ -7786,6 +7786,19 @@ impl<F: BufFactory> Connection<F> {
         self.handshake.is_in_early_data()
     }
 
+    /// Returns true if the connection can send application data: once
+    /// established, during early data, or as a server's 0.5-RTT data once its
+    /// 1-RTT keys are installed (RFC 9000 Section 7, RFC 8446 Section 4.4.4).
+    #[inline]
+    pub fn can_send_app_data(&self) -> bool {
+        self.is_established() ||
+            self.is_in_early_data() ||
+            (self.is_server &&
+                self.crypto_ctx[packet::Epoch::Application]
+                    .crypto_seal
+                    .is_some())
+    }
+
     /// Returns the early data reason for the connection.
     ///
     /// This status can be useful for logging and debugging. See [BoringSSL]
@@ -8275,7 +8288,7 @@ impl<F: BufFactory> Connection<F> {
         // If there are flushable, almost full or blocked streams, use the
         // Application epoch.
         let send_path = self.paths.get(send_pid)?;
-        if (self.is_established() || self.is_in_early_data()) &&
+        if self.can_send_app_data() &&
             (self.should_send_handshake_done() ||
                 self.flow_control.should_update_max_data() ||
                 self.should_send_max_data ||
