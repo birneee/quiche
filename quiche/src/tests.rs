@@ -477,6 +477,28 @@ fn handshake_done(
 }
 
 #[rstest]
+fn server_sends_half_rtt_data(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+    assert!(!pipe.server.is_established());
+    assert!(pipe.server.can_send_app_data());
+
+    // Stream data rides in the server's first flight, before the client's
+    // Finished arrives.
+    assert_eq!(pipe.server.stream_send(3, b"hello", false), Ok(5));
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+    let mut b = [0; 5];
+    assert_eq!(pipe.client.stream_recv(3, &mut b), Ok((5, false)));
+    assert_eq!(&b, b"hello");
+}
+
+#[rstest]
 fn handshake_confirmation(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
 ) {
